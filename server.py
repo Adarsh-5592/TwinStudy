@@ -2021,138 +2021,156 @@ def register_verify_otp():
             "message": "Account creation failed. Please try again."
         }), 500
 
-    db = load_db()
-    if "registered_users" not in db:
-        db["registered_users"] = {}
+    # Persist compatibility metadata only in the newly created account's state.
+    # Do not write account-specific registration data to the shared global document.
+    _STATE_CONTEXT.forced_owner = db_user
+    try:
+        db = load_db()
+        if "registered_users" not in db:
+            db["registered_users"] = {}
 
-    if role == "parent":
-        linking_code = user_data.get("linking_code")
-        parent_user = {
-            "name": user_data["name"],
-            "email": email,
-            "role": "parent",
-            "role_display": "Parent / Guardian",
-            "registered_at": datetime.datetime.now().isoformat(),
-            "linked_student_email": None
-        }
-
-        # A parent account is not linked to a student during registration. Parent
-        # access starts only after a separate link request and explicit student approval.
-        db["registered_users"][email] = parent_user
-        if "pending_verifications" in db and email in db["pending_verifications"]:
-            del db["pending_verifications"][email]
-        save_db(db)
-        token = db_mgr.create_session(db_user["id"])
-        if email in verification_codes:
-            del verification_codes[email]
-        return jsonify({
-            "status": "success",
-            "message": "Parent / Guardian account verified and registered successfully!",
-            "role": "parent",
-            "token": token,
-            "user": parent_user
-        })
-    else:
-        # Student registration
-        # Student registration with fresh, isolated personal data
-        linking_code = user_data.get("_db_linking_code") or f"TS-LINK-{random.randint(1000, 9999)}"
-        is_minor = bool(user_data.get("is_minor"))
-        stu_user = {
-            "name": user_data["name"],
-            "dob": user_data["dob"],
-            "age": user_data["age"],
-            "is_minor": is_minor,
-            "email": email,
-            "role": "student_minor" if is_minor else "student",
-            "role_display": "Student (Minor)" if is_minor else "Student",
-            "linking_code": linking_code,
-            "registered_at": datetime.datetime.now().isoformat(),
-            "points": 100,
-            "streak_days": 1,
-            "daily_study_hours": 3.0,
-            "focus_duration_minutes": 45,
-            "learning_preference": "Practice problems and step-by-step review",
-            "preferred_study_time": "Evening",
-            "goals": [],
-            "college": "",
-            "grade_level": "Enrolled Student",
-            "guardian_email": user_data.get("parent_email", "") if is_minor else "",
-            "academic_profile": {
-                "student_name": user_data["name"],
-                "college": "",
-                "course": "",
-                "semester": "",
-                "specialization": "cs",
-                "academic_year": "2026-2027"
-            },
-            "subjects": [],
-            "classes": [],
-            "tasks": [],
-            "grades": [],
-            "parent_controls": {
-                "guardian_email": user_data.get("parent_email", "") if is_minor else "",
-                "guardian_name": user_data.get("parent_name", "") if is_minor else "",
-                "guardian_approved": True if (is_minor and user_data.get("parent_email")) else False,
-                "allow_view_study_hours": True,
-                "allow_view_proofs": True,
-                "allow_nudges": True
-            },
-            "notifications": [
-                {
-                    "id": f"notif_{int(datetime.datetime.now().timestamp()*1000)}",
-                    "title": f"Welcome to TwinStudy, {user_data['name']}! 🎓",
-                    "description": "Complete your MyStudyLife timetable setup to personalize your twin.",
-                    "time": "Just now",
-                    "type": "reward",
-                    "read": False
-                }
-            ]
-        }
-        db["registered_users"][email] = stu_user
-
-        db["user"] = dict(stu_user)
-        db["academic_profile"] = dict(stu_user["academic_profile"])
-        db["subjects"] = []
-        db["classes"] = []
-        db["tasks"] = []
-        db["grades"] = []
-        db["parent_controls"] = dict(stu_user["parent_controls"])
-
-        # Supplying a guardian email records the intended contact only. It does not
-        # create or approve a parent/student access relationship.
-
-        # Default permissions for student
-        if "parent_permissions" not in db:
-            db["parent_permissions"] = {}
-        if email not in db["parent_permissions"]:
-            db["parent_permissions"][email] = {
-                "tasks": True,
-                "consistency": True,
-                "study_time": True,
-                "login_activity": True,
-                "exam_information": True,
-                "study_history": True,
-                "digital_twin_insights": True,
-                "private_twin_conversations": False,
-                "personal_notes": False,
-                "private_goals": False
+        if role == "parent":
+            linking_code = user_data.get("linking_code")
+            parent_user = {
+                "id": db_user["id"],
+                "name": user_data["name"],
+                "email": email,
+                "role": "parent",
+                "role_display": "Parent / Guardian",
+                "registered_at": datetime.datetime.now().isoformat(),
+                "linked_student_email": None
             }
 
-        if "pending_verifications" in db and email in db["pending_verifications"]:
-            del db["pending_verifications"][email]
-        save_db(db)
-        token = db_mgr.create_session(db_user["id"])
-        if email in verification_codes:
-            del verification_codes[email]
+            # A parent account is not linked to a student during registration. Parent
+            # access starts only after a separate link request and explicit student approval.
+            db["registered_users"][email] = parent_user
+            if "pending_verifications" in db and email in db["pending_verifications"]:
+                del db["pending_verifications"][email]
+            save_db(db)
+            token = db_mgr.create_session(db_user["id"])
+            if email in verification_codes:
+                del verification_codes[email]
+            return jsonify({
+                "status": "success",
+                "message": "Parent / Guardian account verified and registered successfully!",
+                "role": "parent",
+                "token": token,
+                "user": parent_user
+            })
+        else:
+            # Student registration
+            # Student registration with fresh, isolated personal data
+            linking_code = user_data.get("_db_linking_code") or f"TS-LINK-{random.randint(1000, 9999)}"
+            is_minor = bool(user_data.get("is_minor"))
+            stu_user = {
+                "id": db_user["id"],
+                "name": user_data["name"],
+                "dob": user_data["dob"],
+                "age": user_data["age"],
+                "is_minor": is_minor,
+                "email": email,
+                "role": "student_minor" if is_minor else "student",
+                "role_display": "Student (Minor)" if is_minor else "Student",
+                "linking_code": linking_code,
+                "registered_at": datetime.datetime.now().isoformat(),
+                "points": 100,
+                "streak_days": 1,
+                "daily_study_hours": 3.0,
+                "focus_duration_minutes": 45,
+                "learning_preference": "Practice problems and step-by-step review",
+                "preferred_study_time": "Evening",
+                "goals": [],
+                "college": "",
+                "grade_level": "Enrolled Student",
+                "guardian_email": user_data.get("parent_email", "") if is_minor else "",
+                "academic_profile": {
+                    "student_name": user_data["name"],
+                    "college": "",
+                    "course": "",
+                    "semester": "",
+                    "specialization": "cs",
+                    "academic_year": "2026-2027"
+                },
+                "subjects": [],
+                "classes": [],
+                "tasks": [],
+                "grades": [],
+                "parent_controls": {
+                    "guardian_email": user_data.get("parent_email", "") if is_minor else "",
+                    "guardian_name": user_data.get("parent_name", "") if is_minor else "",
+                    "guardian_approved": True if (is_minor and user_data.get("parent_email")) else False,
+                    "allow_view_study_hours": True,
+                    "allow_view_proofs": True,
+                    "allow_nudges": True
+                },
+                "notifications": [
+                    {
+                        "id": f"notif_{int(datetime.datetime.now().timestamp()*1000)}",
+                        "title": f"Welcome to TwinStudy, {user_data['name']}! 🎓",
+                        "description": "Complete your MyStudyLife timetable setup to personalize your twin.",
+                        "time": "Just now",
+                        "type": "reward",
+                        "read": False
+                    }
+                ]
+            }
+            db["registered_users"][email] = stu_user
+
+            db["user"] = dict(stu_user)
+            db["academic_profile"] = dict(stu_user["academic_profile"])
+            db["subjects"] = []
+            db["classes"] = []
+            db["tasks"] = []
+            db["grades"] = []
+            db["parent_controls"] = dict(stu_user["parent_controls"])
+
+            # Supplying a guardian email records the intended contact only. It does not
+            # create or approve a parent/student access relationship.
+
+            # Default permissions for student
+            if "parent_permissions" not in db:
+                db["parent_permissions"] = {}
+            if email not in db["parent_permissions"]:
+                db["parent_permissions"][email] = {
+                    "tasks": True,
+                    "consistency": True,
+                    "study_time": True,
+                    "login_activity": True,
+                    "exam_information": True,
+                    "study_history": True,
+                    "digital_twin_insights": True,
+                    "private_twin_conversations": False,
+                    "personal_notes": False,
+                    "private_goals": False
+                }
+
+            if "pending_verifications" in db and email in db["pending_verifications"]:
+                del db["pending_verifications"][email]
+            save_db(db)
+            token = db_mgr.create_session(db_user["id"])
+            if email in verification_codes:
+                del verification_codes[email]
+            return jsonify({
+                "status": "success",
+                "message": "Student account verified and registered successfully!",
+                "role": "student",
+                "token": token,
+                "user": db["user"],
+                "is_minor": user_data["is_minor"],
+                "linking_code": linking_code
+            })
+    except Exception:
+        app.logger.exception("Registration finalization failed after account creation for user %s", db_user.get("id"))
+        try:
+            verification_codes.pop(email, None)
+        except Exception:
+            app.logger.exception("Could not clear OTP after registration finalization failure")
         return jsonify({
-            "status": "success",
-            "message": "Student account verified and registered successfully!",
-            "role": "student",
-            "token": token,
-            "user": db["user"],
-            "is_minor": user_data["is_minor"],
-            "linking_code": linking_code
-        })
+            "status": "error",
+            "message": "Your account was created, but setup could not be completed. Please sign in; if sign-in fails, contact support."
+        }), 500
+    finally:
+        _STATE_CONTEXT.forced_owner = None
 
 @app.route("/api/auth/get-code", methods=["GET", "POST"])
 def auth_get_code():

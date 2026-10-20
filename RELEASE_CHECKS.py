@@ -122,5 +122,18 @@ class ReleaseChecks(unittest.TestCase):
             if p.is_file():
                 self.assertNotIn(p.suffix.lower(), {'.db', '.sqlite', '.sqlite3'})
 
+
+    def test_registration_compatibility_state_is_scoped_and_owner_is_always_cleared(self):
+        start = self.server.index("def register_verify_otp():")
+        end = self.server.index('@app.route("/api/auth/get-code"', start)
+        body = self.server[start:end]
+        self.assertIn("_STATE_CONTEXT.forced_owner = db_user", body)
+        self.assertEqual(body.count('"id": db_user["id"]'), 2)
+        self.assertIn("finally:", body)
+        self.assertIn("_STATE_CONTEXT.forced_owner = None", body)
+        self.assertIn("Registration finalization failed after account creation", body)
+        self.assertIn("Your account was created, but setup could not be completed", body)
+        self.assertIn("verification_codes.pop(email, None)", body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
