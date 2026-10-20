@@ -2612,113 +2612,117 @@ def auth_login():
 
     # The request may use a linking code rather than an email. Once the password
     # is verified, explicitly scope subsequent reads/writes to this database user.
-    _STATE_CONTEXT.forced_owner = rel_user
-    db = load_db()
-    registered = db.get("registered_users", {})
-    authenticated_email = (rel_user.get("email") or identifier).strip().lower()
-    matched_user = {}
+    try:
+        _STATE_CONTEXT.forced_owner = rel_user
+        db = load_db()
+        registered = db.get("registered_users", {})
+        authenticated_email = (rel_user.get("email") or identifier).strip().lower()
+        matched_user = {}
 
-    for email_key, profile in registered.items():
-        if str(email_key).strip().lower() == authenticated_email:
-            if isinstance(profile, dict):
-                matched_user.update(profile)
-            break
+        for email_key, profile in registered.items():
+            if str(email_key).strip().lower() == authenticated_email:
+                if isinstance(profile, dict):
+                    matched_user.update(profile)
+                break
 
-    # Database identity and account fields take precedence over JSON.
-    matched_user.update(rel_user)
-    matched_user.pop("password", None)
+        # Database identity and account fields take precedence over JSON.
+        matched_user.update(rel_user)
+        matched_user.pop("password", None)
 
 
-    user_id = matched_user.get("id") or f"usr_{identifier.replace('@', '_').replace('.', '_')}"
-    token = db_mgr.create_session(user_id)
-    user_role = matched_user.get("role", "student")
+        user_id = matched_user.get("id") or f"usr_{identifier.replace('@', '_').replace('.', '_')}"
+        token = db_mgr.create_session(user_id)
+        user_role = matched_user.get("role", "student")
 
-    if user_role == "parent":
-        p_email = matched_user.get("email", identifier).strip().lower()
-        approved_links = db_mgr.get_linked_students_for_parent(p_email)
-        linked_stu = approved_links[0].get("student_email") if len(approved_links) == 1 else None
-        return jsonify({
-            "status": "success",
-            "message": f"Welcome to Parent / Guardian Dashboard, {matched_user.get('name', 'Parent')}!",
-            "role": "parent",
-            "token": token,
-            "user": {
-                "id": user_id,
-                "name": matched_user.get("name", "Parent / Guardian"),
-                "email": p_email,
+        if user_role == "parent":
+            p_email = matched_user.get("email", identifier).strip().lower()
+            approved_links = db_mgr.get_linked_students_for_parent(p_email)
+            linked_stu = approved_links[0].get("student_email") if len(approved_links) == 1 else None
+            return jsonify({
+                "status": "success",
+                "message": f"Welcome to Parent / Guardian Dashboard, {matched_user.get('name', 'Parent')}!",
                 "role": "parent",
-                "linked_student_email": linked_stu
+                "token": token,
+                "user": {
+                    "id": user_id,
+                    "name": matched_user.get("name", "Parent / Guardian"),
+                    "email": p_email,
+                    "role": "parent",
+                    "linked_student_email": linked_stu
+                }
+            })
+        else:
+            # Student login
+            now = datetime.datetime.now()
+            act_entry = {
+                "id": f"act_{int(now.timestamp()*1000)}",
+                "user_email": matched_user.get("email", identifier),
+                "login_time": now.strftime("%I:%M %p"),
+                "logout_time": "Active Now",
+                "duration": "In Progress",
+                "date": "Today"
             }
-        })
-    else:
-        # Student login
-        now = datetime.datetime.now()
-        act_entry = {
-            "id": f"act_{int(now.timestamp()*1000)}",
-            "user_email": matched_user.get("email", identifier),
-            "login_time": now.strftime("%I:%M %p"),
-            "logout_time": "Active Now",
-            "duration": "In Progress",
-            "date": "Today"
-        }
-        if "activity_logs" not in db:
-            db["activity_logs"] = []
-        db["activity_logs"].insert(0, act_entry)
+            if "activity_logs" not in db:
+                db["activity_logs"] = []
+            db["activity_logs"].insert(0, act_entry)
 
-        is_minor = bool(matched_user.get("is_minor"))
-        stu_email = matched_user.get("email", identifier)
-        db["user"] = {
-            "id": user_id,
-            "name": matched_user.get("name", "Student"),
-            "email": stu_email,
-            "dob": matched_user.get("dob", ""),
-            "age": matched_user.get("age", 20),
-            "is_minor": is_minor,
-            "role": "student_minor" if is_minor else "student",
-            "role_display": "Student (Minor)" if is_minor else "Student",
-            "points": matched_user.get("points", 100),
-            "streak_days": matched_user.get("streak_days", 1),
-            "daily_study_hours": matched_user.get("daily_study_hours", 3.0),
-            "focus_duration_minutes": matched_user.get("focus_duration_minutes", 45),
-            "learning_preference": matched_user.get("learning_preference", "Practice problems and step-by-step review"),
-            "preferred_study_time": matched_user.get("preferred_study_time", "Evening"),
-            "goals": matched_user.get("goals", []),
-            "college": matched_user.get("college") or matched_user.get("academic_profile", {}).get("college", ""),
-            "grade_level": matched_user.get("grade_level") or (f"{matched_user.get('academic_profile', {}).get('course', '')} ({matched_user.get('academic_profile', {}).get('semester', '')})" if matched_user.get("academic_profile", {}).get("course") else "Enrolled Student"),
-            "guardian_email": matched_user.get("guardian_email", "") if is_minor else "",
-            "linking_code": matched_user.get("linking_code", "TS-LINK-8921")
-        }
-        db["academic_profile"] = matched_user.get("academic_profile") or {
-            "student_name": matched_user.get("name", "Student"),
-            "college": "",
-            "course": "",
-            "semester": "",
-            "specialization": "cs",
-            "academic_year": "2026-2027"
-        }
-        db["subjects"] = matched_user.get("subjects") or []
-        db["classes"] = matched_user.get("classes") or []
-        db["tasks"] = matched_user.get("tasks") or []
-        db["grades"] = matched_user.get("grades") or []
-        db["parent_controls"] = matched_user.get("parent_controls") or {
-            "guardian_email": matched_user.get("guardian_email", "") if is_minor else "",
-            "guardian_name": matched_user.get("parent_name", "") if is_minor else "",
-            "guardian_approved": False,
-            "allow_view_study_hours": True,
-            "allow_view_proofs": True,
-            "allow_nudges": True
-        }
+            is_minor = bool(matched_user.get("is_minor"))
+            stu_email = matched_user.get("email", identifier)
+            db["user"] = {
+                "id": user_id,
+                "name": matched_user.get("name", "Student"),
+                "email": stu_email,
+                "dob": matched_user.get("dob", ""),
+                "age": matched_user.get("age", 20),
+                "is_minor": is_minor,
+                "role": "student_minor" if is_minor else "student",
+                "role_display": "Student (Minor)" if is_minor else "Student",
+                "points": matched_user.get("points", 100),
+                "streak_days": matched_user.get("streak_days", 1),
+                "daily_study_hours": matched_user.get("daily_study_hours", 3.0),
+                "focus_duration_minutes": matched_user.get("focus_duration_minutes", 45),
+                "learning_preference": matched_user.get("learning_preference", "Practice problems and step-by-step review"),
+                "preferred_study_time": matched_user.get("preferred_study_time", "Evening"),
+                "goals": matched_user.get("goals", []),
+                "college": matched_user.get("college") or matched_user.get("academic_profile", {}).get("college", ""),
+                "grade_level": matched_user.get("grade_level") or (f"{matched_user.get('academic_profile', {}).get('course', '')} ({matched_user.get('academic_profile', {}).get('semester', '')})" if matched_user.get("academic_profile", {}).get("course") else "Enrolled Student"),
+                "guardian_email": matched_user.get("guardian_email", "") if is_minor else "",
+                "linking_code": matched_user.get("linking_code", "TS-LINK-8921")
+            }
+            db["academic_profile"] = matched_user.get("academic_profile") or {
+                "student_name": matched_user.get("name", "Student"),
+                "college": "",
+                "course": "",
+                "semester": "",
+                "specialization": "cs",
+                "academic_year": "2026-2027"
+            }
+            db["subjects"] = matched_user.get("subjects") or []
+            db["classes"] = matched_user.get("classes") or []
+            db["tasks"] = matched_user.get("tasks") or []
+            db["grades"] = matched_user.get("grades") or []
+            db["parent_controls"] = matched_user.get("parent_controls") or {
+                "guardian_email": matched_user.get("guardian_email", "") if is_minor else "",
+                "guardian_name": matched_user.get("parent_name", "") if is_minor else "",
+                "guardian_approved": False,
+                "allow_view_study_hours": True,
+                "allow_view_proofs": True,
+                "allow_nudges": True
+            }
 
-        save_db(db)
+            save_db(db)
 
-        return jsonify({
-            "status": "success",
-            "message": f"Welcome back, {db['user']['name']}!",
-            "role": "student",
-            "token": token,
-            "user": db["user"],
-            "is_minor": is_minor
-        })
+            return jsonify({
+                "status": "success",
+                "message": f"Welcome back, {db['user']['name']}!",
+                "role": "student",
+                "token": token,
+                "user": db["user"],
+                "is_minor": is_minor
+            })
+
+    finally:
+        _STATE_CONTEXT.forced_owner = None
 
 @app.route("/api/auth/me", methods=["GET"])
 def auth_me():
