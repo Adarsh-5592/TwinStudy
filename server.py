@@ -26,6 +26,7 @@ import datetime
 import threading
 from urllib.parse import urlparse
 import smtplib
+import tempfile
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate, make_msgid
@@ -36,8 +37,10 @@ load_dotenv()
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash
-from db_manager import db_mgr
+from db_manager import ConcurrentUpdateError, db_mgr
 import ai_service
+from authorization import endpoint_role_allowed
+from parent_visibility import apply_parent_visibility
 
 app = Flask(__name__, static_folder="public", static_url_path="")
 CORS(app)
@@ -47,7 +50,7 @@ CORS(app)
 _PUBLIC_API_ENDPOINTS = {
     "register_send_otp", "register_verify_otp", "auth_get_code", "resend_otp",
     "google_auth_config", "google_auth", "auth_login",
-    "forgot_send_otp", "forgot_verify_otp",
+    "forgot_send_otp", "forgot_verify_otp", "vercel_serverless_gateway",
 }
 
 @app.before_request
@@ -66,6 +69,8 @@ def require_session_for_non_public_api():
     user = get_auth_user(request)
     if not user:
         return jsonify({"status": "error", "message": "Authentication required. Please sign in."}), 401
+    if not endpoint_role_allowed(base_endpoint, user.get("role")):
+        return jsonify({"status": "error", "message": "A signed-in student session is required."}), 403
     return None
 
 IS_VERCEL = bool(os.environ.get("VERCEL"))
@@ -104,6 +109,17 @@ def get_auth_user(req, allow_guest=False):
     if allow_guest:
         return None
     return None
+
+
+def _parse_data_revision(value):
+    """Accept only positive JSON integers (or their decimal string form)."""
+    if isinstance(value, bool):
+        raise ValueError("A valid revision is required")
+    if isinstance(value, int) and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value.strip()):
+        return int(value.strip())
+    raise ValueError("A valid revision is required")
 
 class PersistentOTPStore:
     """Dictionary-compatible OTP store backed by the configured relational DB.
@@ -147,16 +163,34 @@ class PersistentOTPStore:
         if not saved:
             raise RuntimeError("OTP record could not be persisted")
 
-    def decrement_attempts(self, email):
+    def decrement_attempts(self, email, code_digest=None, purpose=None):
         """Atomically consume one OTP attempt across concurrent workers."""
-        return self.manager.decrement_otp_attempts(str(email).strip().lower())
+        return self.manager.decrement_otp_attempts(
+            str(email).strip().lower(), code_digest=code_digest, purpose=purpose
+        )
+
+    def consume(self, email, purpose, code_digest):
+        """Validate and atomically consume a successful OTP exactly once."""
+        return self.manager.consume_otp(str(email).strip().lower(), purpose, code_digest)
 
     def __delitem__(self, email):
-        self.manager.delete_otp(str(email).strip().lower())
+        record = self.get(email)
+        if record:
+            self.manager.delete_otp(
+                str(email).strip().lower(),
+                code_digest=_otp_record_digest(record), purpose=record.get("purpose"),
+            )
 
-    def pop(self, email, default=None):
+    def pop(self, email, default=None, code_digest=None, purpose=None):
         old = self.get(email, default)
-        self.manager.delete_otp(str(email).strip().lower())
+        digest = code_digest
+        if digest is None and old:
+            digest = _otp_record_digest(old)
+            purpose = purpose or old.get("purpose")
+        if digest is not None:
+            self.manager.delete_otp(
+                str(email).strip().lower(), code_digest=digest, purpose=purpose
+            )
         return old
 
     def __contains__(self, email):
@@ -165,6 +199,78 @@ class PersistentOTPStore:
 
 # OTPs must be shared across serverless workers; do not rely on process memory.
 verification_codes = PersistentOTPStore(db_mgr)
+
+
+def _otp_record_digest(record):
+    """Return the stored digest for either a legacy in-memory or persisted row."""
+    code = str((record or {}).get("code") or "")
+    return code if (record or {}).get("_code_is_hash") else hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _merge_compatibility_tasks(nested_tasks, root_tasks):
+    """Merge the two legacy task views, preferring nested values without losing progress."""
+    nested = nested_tasks if isinstance(nested_tasks, list) else []
+    root = root_tasks if isinstance(root_tasks, list) else []
+    merged = []
+    by_id = {}
+    root_fingerprints = set()
+
+    def fingerprint(item):
+        return tuple(str(item.get(key) or "").strip().lower() for key in (
+            "subject_id", "subject_name", "subject", "title", "due_date", "due"
+        ))
+
+    def add(raw, from_root=False):
+        if not isinstance(raw, dict):
+            return
+        item = dict(raw)
+        task_id = str(item.get("id") or "").strip()
+        if not task_id:
+            signature = fingerprint(item)
+            if not any(signature):
+                return
+            if not from_root and signature in root_fingerprints:
+                return
+            merged.append(item)
+            return
+        if task_id not in by_id:
+            by_id[task_id] = len(merged)
+            merged.append(item)
+            return
+        index = by_id[task_id]
+        previous = merged[index]
+        combined = {**previous, **{key: value for key, value in item.items() if value not in (None, "")}}
+        # A stale view must not turn completed work back into pending work.
+        if previous.get("verified") or item.get("verified"):
+            combined["verified"] = True
+        completion_states = {"completed", "complete", "done", "verified", "verified & done"}
+        statuses = [str(value or "") for value in (previous.get("status"), item.get("status"))]
+        completed = next((value for value in statuses if value.strip().lower() in completion_states), None)
+        if completed:
+            combined["status"] = completed
+        for key in ("verified_file", "verified_at", "quiz_score", "proof_required", "proof_status"):
+            combined[key] = item.get(key) or previous.get(key) or ""
+        for key in ("points", "points_reward"):
+            values = []
+            for value in (previous.get(key), item.get(key)):
+                try:
+                    if value not in (None, ""):
+                        values.append(float(value))
+                except (TypeError, ValueError):
+                    pass
+            if values:
+                combined[key] = max(values)
+        merged[index] = combined
+
+    for item in root:
+        if isinstance(item, dict):
+            signature = fingerprint(item)
+            if any(signature):
+                root_fingerprints.add(signature)
+            add(item, from_root=True)
+    for item in nested:
+        add(item)
+    return merged
 
 DEFAULT_BEHAVIOR_PATTERNS = []
 DEFAULT_DECISIONS = []
@@ -424,40 +530,55 @@ def get_email_config():
     return cfg
 
 def save_email_config(cfg):
+    def atomic_private_write(path, contents):
+        directory = os.path.dirname(path) or "."
+        fd, temp_path = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", dir=directory)
+        try:
+            if os.name == "posix":
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                fd = -1
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, path)
+            temp_path = None
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
     try:
-        with open(EMAIL_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2)
-        # Update .env as well
         env_file = os.path.join(os.path.dirname(__file__), ".env")
         lines = []
         if os.path.exists(env_file):
-            try:
-                with open(env_file, "r", encoding="utf-8") as ef:
-                    lines = ef.readlines()
-            except Exception:
-                pass
-        sender_found = False
-        pass_found = False
-        sender_val = cfg.get('sender_email', '')
-        pass_val = cfg.get('sender_password', '')
+            with open(env_file, "r", encoding="utf-8") as ef:
+                lines = ef.readlines()
+        sender_val = cfg.get("sender_email", "")
+        pass_val = cfg.get("sender_password", "")
         new_lines = []
-        for l in lines:
-            if l.startswith("GMAIL_SENDER="):
+        sender_found = pass_found = False
+        for line in lines:
+            if line.startswith("GMAIL_SENDER="):
                 new_lines.append(f"GMAIL_SENDER={sender_val}\n")
                 sender_found = True
-            elif l.startswith("GMAIL_APP_PASSWORD="):
+            elif line.startswith("GMAIL_APP_PASSWORD="):
                 new_lines.append(f"GMAIL_APP_PASSWORD={pass_val}\n")
                 pass_found = True
             else:
-                new_lines.append(l)
+                new_lines.append(line)
         if not sender_found:
             new_lines.append(f"GMAIL_SENDER={sender_val}\n")
         if not pass_found:
             new_lines.append(f"GMAIL_APP_PASSWORD={pass_val}\n")
-        with open(env_file, "w", encoding="utf-8") as ef:
-            ef.writelines(new_lines)
-    except Exception as e:
-        print(f"[SMTP CONFIG SAVE ERROR]: {e}")
+
+        # Set the private mode on the temporary inode before writing secrets.
+        atomic_private_write(EMAIL_CONFIG_FILE, json.dumps(cfg, indent=2))
+        atomic_private_write(env_file, "".join(new_lines))
+    except Exception:
+        # Do not log or return credential data or low-level persistence errors.
+        raise RuntimeError("SMTP credentials could not be securely persisted") from None
 
 def send_email_via_smtp(to_email: str, subject: str, otp_code: str, action_type="Account Verification"):
     cfg = get_email_config()
@@ -517,9 +638,9 @@ def send_email_via_smtp(to_email: str, subject: str, otp_code: str, action_type=
         server.sendmail(sender, [to_email], msg.as_string())
         server.quit()
         return True, "Email dispatched successfully via Gmail SMTP"
-    except Exception as e:
-        print(f"[SMTP DISPATCH NOTICE]: {e}")
-        return False, str(e)
+    except Exception:
+        # SMTP library errors can include credential or provider response data.
+        return False, "Email delivery failed. Check the server SMTP configuration."
 
 # --- DYNAMIC CONTEXT-AWARE SIMULATION & WHAT-IF ENGINE ---
 
@@ -537,8 +658,13 @@ def get_state():
     if not user:
         return jsonify({"status": "error", "message": "Authentication required."}), 401
     if user:
-        academic_state = db_mgr.get_user_academic_state(user["id"])
-        if academic_state and academic_state.get("user"):
+        for _attempt in range(3):
+            versions_before = db_mgr.get_user_data_versions(user["id"])
+            academic_state = db_mgr.get_user_academic_state(user["id"])
+            if not (academic_state and academic_state.get("user")):
+                break
+            # Compatibility metadata is account-scoped; relational academic rows
+            # and both revision values must describe one stable snapshot.
             academic_state["twin_status"] = data.get("twin_status", {})
             academic_state["cognitive_weights"] = data.get("cognitive_weights", {})
             academic_state["study_telemetry"] = data.get("study_telemetry", {})
@@ -546,7 +672,6 @@ def get_state():
             academic_state["privacy_controls"] = data.get("privacy_controls", {})
             academic_state["activity_logs"] = data.get("activity_logs", [])
             academic_state["subject_targets"] = data.get("subject_targets", {})
-            # Return calendar data from the authenticated student's compatibility record only.
             user_email = (user.get("email") or "").strip().lower()
             registered = data.get("registered_users", {})
             user_json = registered.get(user_email, {}) if user_email and isinstance(registered, dict) else {}
@@ -554,13 +679,24 @@ def get_state():
             calendar_exams = user_json.get("calendar_exams", []) if isinstance(user_json, dict) else []
             try:
                 normalized_calendar = db_mgr.get_user_calendar(user["id"])
-                events = normalized_calendar["calendar_events"] or events
-                calendar_exams = normalized_calendar["calendar_exams"] or calendar_exams
+                if normalized_calendar["calendar_events"] or versions_before["calendar_revision"] > 1:
+                    events = normalized_calendar["calendar_events"]
+                if normalized_calendar["calendar_exams"] or versions_before["calendar_revision"] > 1:
+                    calendar_exams = normalized_calendar["calendar_exams"]
             except Exception:
+                if versions_before["calendar_revision"] > 1:
+                    app.logger.exception("Normalized calendar read failed after relational calendar writes")
+                    return jsonify({"status": "error", "message": "Academic state is temporarily unavailable. Please retry."}), 503
                 app.logger.warning("Could not read normalized calendar records; using compatibility mirror", exc_info=True)
+            versions_after = db_mgr.get_user_data_versions(user["id"])
+            if versions_before != versions_after:
+                continue
             academic_state["calendar_events"] = events if isinstance(events, list) else []
             academic_state["calendar_exams"] = calendar_exams if isinstance(calendar_exams, list) else []
+            academic_state.update(versions_after)
             return jsonify(academic_state)
+        else:
+            return jsonify({"status": "error", "message": "Academic data changed repeatedly while loading. Please retry."}), 503
 
     # Resolve the state owner from the authenticated MariaDB account.
     email = (user.get("email") or "").strip().lower()
@@ -968,7 +1104,15 @@ def save_academic_calendar_events():
     if not isinstance(events, list) or not isinstance(exams, list):
         return jsonify({"status": "error", "message": "Calendar events and exams must be lists."}), 400
     try:
-        db_mgr.save_user_calendar(user["id"], events=events, exams=exams)
+        expected_revision = _parse_data_revision(payload.get("calendar_revision"))
+    except ValueError:
+        return jsonify({"status": "error", "code": "revision_required", "message": "Reload your academic state before saving calendar changes."}), 428
+    try:
+        saved_versions = db_mgr.save_user_calendar(
+            user["id"], events=events, exams=exams, expected_revision=expected_revision
+        )
+    except ConcurrentUpdateError as exc:
+        return jsonify({"status": "error", "code": "stale_revision", "message": str(exc)}), 409
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception:
@@ -987,6 +1131,7 @@ def save_academic_calendar_events():
     except Exception:
         app.logger.warning("Calendar compatibility mirror did not update; relational save succeeded", exc_info=True)
     return jsonify({"status": "success", "message": "Academic calendar saved.",
+                    **saved_versions,
                     "event_count": len(events), "exam_count": len(exams)})
 
 @app.route("/api/academic/save", methods=["POST"])
@@ -1016,7 +1161,23 @@ def save_academic():
     if not email:
         return jsonify({"status": "error", "message": "Student account email is unavailable."}), 401
 
+    try:
+        academic_revision = _parse_data_revision(data.get("academic_revision"))
+    except ValueError:
+        return jsonify({"status": "error", "code": "revision_required", "message": "Reload your academic state before saving academic changes."}), 428
+    calendar_revision = None
+    if calendar_events is not None or calendar_exams is not None:
+        try:
+            calendar_revision = _parse_data_revision(data.get("calendar_revision"))
+        except ValueError:
+            return jsonify({"status": "error", "code": "revision_required", "message": "Reload your academic state before saving calendar changes."}), 428
+
     db = load_db()
+    compatibility_tasks = []
+    registered_state = db.get("registered_users", {})
+    student_state = registered_state.get(email, {}) if isinstance(registered_state, dict) else {}
+    nested_tasks = student_state.get("tasks", []) if isinstance(student_state, dict) else []
+    compatibility_tasks = _merge_compatibility_tasks(nested_tasks, db.get("tasks", []))
 
     # Generate dynamic proof-based tasks for these subjects
     dynamic_tasks = []
@@ -1045,14 +1206,27 @@ def save_academic():
 
     # Normalized academic data are replaced atomically and scoped to the session owner.
     user_id = user["id"]
+    saved_versions = None
     try:
-        saved_academic = db_mgr.save_user_academic_state(user_id, profile, subjects, classes, dynamic_tasks)
+        saved_academic = db_mgr.save_user_academic_state(
+            user_id, profile, subjects, classes, dynamic_tasks, preserve_existing_tasks=True,
+            expected_revision=academic_revision,
+            calendar_events=calendar_events, calendar_exams=calendar_exams,
+            expected_calendar_revision=calendar_revision,
+            compatibility_tasks=compatibility_tasks
+        )
         profile = saved_academic["academic_profile"]
+        saved_versions = {
+            "academic_revision": saved_academic["academic_revision"],
+            "calendar_revision": saved_academic["calendar_revision"],
+        }
         subjects = saved_academic["subjects"]
         classes = saved_academic["classes"]
-        dynamic_tasks = saved_academic["tasks"] or []
-        if calendar_events is not None or calendar_exams is not None:
-            db_mgr.save_user_calendar(user_id, events=calendar_events, exams=calendar_exams)
+        dynamic_tasks = saved_academic["tasks"]
+        if dynamic_tasks is None:
+            dynamic_tasks = db_mgr.get_user_tasks(user_id)
+    except ConcurrentUpdateError as exc:
+        return jsonify({"status": "error", "code": "stale_revision", "message": str(exc)}), 409
     except ValueError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception:
@@ -1102,6 +1276,7 @@ def save_academic():
         "calendar_events": calendar_events if calendar_events is not None else db["registered_users"][email].get("calendar_events", []),
         "calendar_exams": calendar_exams if calendar_exams is not None else db["registered_users"][email].get("calendar_exams", []),
         "tasks": dynamic_tasks,
+        **saved_versions,
     })
 
 @app.route("/api/tasks/create", methods=["POST"])
@@ -1251,7 +1426,7 @@ def generate_student_tasks():
         })
 
     try:
-        dynamic_tasks = db_mgr.replace_user_tasks(user["id"], dynamic_tasks)
+        dynamic_tasks = db_mgr.add_generated_tasks(user["id"], dynamic_tasks)
     except Exception:
         app.logger.exception("Atomic task generation failed")
         return jsonify({"status": "error", "message": "Tasks could not be generated and saved. Please retry."}), 503
@@ -1278,6 +1453,11 @@ def update_student_profile():
     email = (auth_user.get("email") or "").strip().lower()
     if not email:
         return jsonify({"status": "error", "message": "The signed-in account has no email address."}), 400
+
+    try:
+        academic_revision = _parse_data_revision(data.get("academic_revision"))
+    except ValueError:
+        return jsonify({"status": "error", "code": "revision_required", "message": "Reload your academic state before saving profile changes."}), 428
 
     # Validate age rather than silently swallowing bad input.
     age_value = data.get("age", auth_user.get("age", 20))
@@ -1316,25 +1496,13 @@ def update_student_profile():
 
     role = "student_minor" if is_minor else "student_adult"
     try:
-        # Authenticated identity determines which MariaDB row is updated; never trust the posted email.
-        db_mgr.execute("""
-            UPDATE users
-            SET name = %s, dob = %s, age = %s, is_minor = %s, role = %s,
-                guardian_email = %s, daily_study_hours = %s, college = %s,
-                grade_level = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (name, dob, age_value, 1 if is_minor else 0, role, guardian_email,
-              daily_hours, college, grade_level, user_id))
-
-        # Update the existing student profile if it exists; do not rebuild or overwrite academic records.
-        if current_profile:
-            db_mgr.execute("""
-                UPDATE student_profiles
-                SET student_name = %s, college = %s, course = %s, semester = %s
-                WHERE user_id = %s
-            """, (name, college, course, semester, user_id))
-
+        saved_versions = db_mgr.update_student_profile_fields(
+            user_id, name, dob, age_value, is_minor, role, guardian_email,
+            daily_hours, college, grade_level, course, semester, academic_revision
+        )
         # A changed guardian address is recorded on the user, but is NOT treated as guardian approval.
+    except ConcurrentUpdateError as exc:
+        return jsonify({"status": "error", "code": "stale_revision", "message": str(exc)}), 409
     except Exception:
         app.logger.exception("Could not persist student profile to MariaDB")
         return jsonify({"status": "error", "message": "Profile could not be saved to the database. Please try again."}), 500
@@ -1377,6 +1545,7 @@ def update_student_profile():
     return jsonify({
         "status": "success",
         "message": "Student profile saved successfully.",
+        **saved_versions,
         "user": {
             "id": saved_user.get("id", user_id), "name": saved_user.get("name", name),
             "email": saved_user.get("email", email), "dob": saved_user.get("dob", dob),
@@ -1725,19 +1894,35 @@ def get_parent_dashboard_data():
     overview = {
         "name": student_name, "age": student_user.get("age", 20), "course": profile.get("course") or student_user.get("grade_level", ""),
         "semester": profile.get("semester", ""), "college": profile.get("college") or student_user.get("college", ""),
-        "current_streak": student_user.get("streak_days", 0), "weekly_study_time": f"{weekly_minutes // 60}h {weekly_minutes % 60}m",
-        "tasks_completed_ratio": f"{completed_tasks}/{total_tasks}", "tasks_completed_pct": progress_pct,
-        "upcoming_exam_days": exam_items[0]["days_left"] if exam_items else None,
-        "academic_status": "Based on recorded academic activity" if (tasks or exams or sessions) else "Not enough recorded activity yet",
+        "current_streak": student_user.get("streak_days", 0) if permissions["consistency"] else None,
+        "weekly_study_time": f"{weekly_minutes // 60}h {weekly_minutes % 60}m" if permissions["study_time"] else None,
+        "tasks_completed_ratio": f"{completed_tasks}/{total_tasks}" if permissions["tasks"] else None,
+        "tasks_completed_pct": progress_pct if permissions["tasks"] else None,
+        "upcoming_exam_days": exam_items[0]["days_left"] if exam_items and permissions["exam_information"] else None,
+        "academic_status": "Based on recorded academic activity" if (
+            (tasks and permissions["tasks"])
+            or (exams and permissions["exam_information"])
+            or (sessions and (permissions["study_time"] or permissions["consistency"]))
+        ) else "Not enough visible activity to summarize",
     }
-    task_progress = {"permitted": permissions["tasks"], "total": total_tasks, "completed": completed_tasks, "pending": pending_tasks, "overdue": overdue_tasks, "progress_percent": progress_pct, "items": task_items if permissions["tasks"] else []}
-    consistency = {"permitted": permissions["consistency"], "current_streak": student_user.get("streak_days", 0), "longest_streak": None, "days_studied_this_week": sum(1 for v in heatmap if v["hours"] > 0), "days_missed_this_week": sum(1 for v in heatmap if v["hours"] == 0), "weekly_consistency_percent": round(sum(1 for v in heatmap if v["hours"] > 0) * 100 / 7), "heatmap": heatmap if permissions["consistency"] else []}
+    task_progress = {"permitted": permissions["tasks"], "total": total_tasks if permissions["tasks"] else None, "completed": completed_tasks if permissions["tasks"] else None, "pending": pending_tasks if permissions["tasks"] else None, "overdue": overdue_tasks if permissions["tasks"] else None, "progress_percent": progress_pct if permissions["tasks"] else None, "items": task_items if permissions["tasks"] else []}
+    consistency = {"permitted": permissions["consistency"], "current_streak": student_user.get("streak_days", 0) if permissions["consistency"] else None, "longest_streak": None, "days_studied_this_week": sum(1 for v in heatmap if v["hours"] > 0) if permissions["consistency"] else None, "days_missed_this_week": sum(1 for v in heatmap if v["hours"] == 0) if permissions["consistency"] else None, "weekly_consistency_percent": round(sum(1 for v in heatmap if v["hours"] > 0) * 100 / 7) if permissions["consistency"] else None, "heatmap": heatmap if permissions["consistency"] else []}
     daily_breakdown = [{"day": v["date"], "time": f"{int(v['hours'])}h {int((v['hours'] % 1) * 60)}m", "minutes": int(v["hours"] * 60)} for v in heatmap]
-    weekly_time = {"permitted": permissions["study_time"], "total_this_week": f"{weekly_minutes // 60}h {weekly_minutes % 60}m", "total_last_week": "Not available", "percent_change": None, "daily_breakdown": daily_breakdown if permissions["study_time"] else []}
+    weekly_time = {"permitted": permissions["study_time"], "total_this_week": f"{weekly_minutes // 60}h {weekly_minutes % 60}m" if permissions["study_time"] else None, "total_last_week": "Not available", "percent_change": None, "daily_breakdown": daily_breakdown if permissions["study_time"] else []}
+    overview, task_progress, consistency, weekly_time = apply_parent_visibility(
+        overview, task_progress, consistency, weekly_time, permissions
+    )
     login = {"permitted": permissions["login_activity"], "last_login": None, "last_logout": None, "total_sessions": len(activity), "average_session_duration": None, "recent_logs": activity[:10] if permissions["login_activity"] else []}
     insights = []
-    if permissions["digital_twin_insights"] and (tasks or exams or sessions):
-        insights.append({"icon": "📚", "title": "Academic activity", "text": f"TwinStudy has {len(tasks)} recorded tasks, {len(exams)} exams, and {len(sessions)} study sessions for this student.", "category": "Activity"})
+    visible_activity_parts = []
+    if permissions["tasks"]:
+        visible_activity_parts.append(f"{len(tasks)} task(s)")
+    if permissions["exam_information"]:
+        visible_activity_parts.append(f"{len(exams)} exam(s)")
+    if permissions["study_time"] or permissions["study_history"]:
+        visible_activity_parts.append(f"{len(sessions)} study session(s)")
+    if permissions["digital_twin_insights"] and visible_activity_parts:
+        insights.append({"icon": "📚", "title": "Academic activity", "text": "Recorded activity in shared categories: " + ", ".join(visible_activity_parts) + ".", "category": "Activity"})
     return jsonify({
         "status": "success", "approved": True, "relationship": relationship, "overview": overview,
         "task_progress": task_progress, "consistency": consistency, "weekly_study_time": weekly_time,
@@ -1769,7 +1954,10 @@ def configure_smtp():
         return jsonify({"status": "error", "message": "Both sender email and Gmail app password are required."}), 400
 
     cfg = {"configured": True, "sender_email": sender, "sender_password": password}
-    save_email_config(cfg)
+    try:
+        save_email_config(cfg)
+    except RuntimeError:
+        return jsonify({"status": "error", "message": "SMTP credentials could not be securely saved."}), 500
     return jsonify({"status": "success", "message": "Gmail SMTP configuration saved successfully!"})
 
 @app.route("/api/auth/test-smtp", methods=["POST"])
@@ -1782,7 +1970,10 @@ def test_smtp():
     password = data.get("sender_password", "").strip()
 
     if sender and password:
-        save_email_config({"configured": True, "sender_email": sender, "sender_password": password})
+        try:
+            save_email_config({"configured": True, "sender_email": sender, "sender_password": password})
+        except RuntimeError:
+            return jsonify({"status": "error", "message": "SMTP credentials could not be securely saved."}), 500
 
     if not test_target:
         db = load_db()
@@ -1923,7 +2114,9 @@ def register_send_otp():
     else:
         # Do not leave an unusable pending registration (or its personal data) when
         # delivery fails. The user can safely retry after correcting SMTP settings.
-        verification_codes.pop(email, None)
+        verification_codes.pop(
+            email, None, code_digest=hashlib.sha256(otp.encode("utf-8")).hexdigest(), purpose="register"
+        )
         return jsonify({
             "status": "error",
             "message": f"Could not dispatch verification email to {email}: {smtp_msg}."
@@ -1942,13 +2135,13 @@ def register_verify_otp():
     record = verification_codes.get(email)
     if not record or record.get("purpose") != "register":
         return jsonify({"status": "error", "message": "No pending registration found for this email. Please request a new code."}), 400
+    expected_code_hash = _otp_record_digest(record)
 
     # Expiration check
     try:
         expires_at = datetime.datetime.fromisoformat(record["expires_at"])
         if datetime.datetime.now() > expires_at:
-            if email in verification_codes:
-                del verification_codes[email]
+            verification_codes.pop(email, None, code_digest=expected_code_hash, purpose="register")
             if "pending_verifications" in db and email in db["pending_verifications"]:
                 del db["pending_verifications"][email]
                 save_db(db)
@@ -1958,23 +2151,29 @@ def register_verify_otp():
 
     # Attempts check
     if record.get("attempts_left", 5) <= 0:
-        if email in verification_codes:
-            del verification_codes[email]
+        verification_codes.pop(email, None, code_digest=expected_code_hash, purpose="register")
         if "pending_verifications" in db and email in db["pending_verifications"]:
             del db["pending_verifications"][email]
             save_db(db)
         return jsonify({"status": "error", "message": "Too many invalid attempts. Please request a fresh verification code."}), 400
 
     submitted_code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-    expected_code_hash = record["code"] if record.get("_code_is_hash") else hashlib.sha256(str(record.get("code", "")).encode("utf-8")).hexdigest()
     if not hmac.compare_digest(str(expected_code_hash), submitted_code_hash):
-        attempts_left = verification_codes.decrement_attempts(email)
+        attempts_left = verification_codes.decrement_attempts(
+            email, expected_code_hash, "register"
+        )
         if attempts_left <= 0:
-            verification_codes.pop(email, None)
+            verification_codes.pop(
+                email, None, code_digest=expected_code_hash, purpose="register"
+            )
         return jsonify({
             "status": "error",
             "message": f"Incorrect verification code. {attempts_left} attempt(s) remaining."
         }), 400
+
+    record = verification_codes.consume(email, "register", submitted_code_hash)
+    if not record:
+        return jsonify({"status": "error", "message": "Verification code is invalid, expired, or already used. Request a new code."}), 400
 
     # OTP Verified! Finalize Registration
     user_data = record["data"]
@@ -2050,8 +2249,6 @@ def register_verify_otp():
                 del db["pending_verifications"][email]
             save_db(db)
             token = db_mgr.create_session(db_user["id"])
-            if email in verification_codes:
-                del verification_codes[email]
             return jsonify({
                 "status": "success",
                 "message": "Parent / Guardian account verified and registered successfully!",
@@ -2150,8 +2347,6 @@ def register_verify_otp():
                 del db["pending_verifications"][email]
             save_db(db)
             token = db_mgr.create_session(db_user["id"])
-            if email in verification_codes:
-                del verification_codes[email]
             return jsonify({
                 "status": "success",
                 "message": "Student account verified and registered successfully!",
@@ -2163,10 +2358,6 @@ def register_verify_otp():
             })
     except Exception:
         app.logger.exception("Registration finalization failed after account creation for user %s", db_user.get("id"))
-        try:
-            verification_codes.pop(email, None)
-        except Exception:
-            app.logger.exception("Could not clear OTP after registration finalization failure")
         return jsonify({
             "status": "error",
             "message": "Your account was created, but setup could not be completed. Please sign in; if sign-in fails, contact support."
@@ -2237,7 +2428,9 @@ def resend_otp():
     else:
         # The new code was not delivered, so invalidate it instead of leaving the
         # previous code silently replaced by an unusable one.
-        verification_codes.pop(email, None)
+        verification_codes.pop(
+            email, None, code_digest=hashlib.sha256(new_otp.encode("utf-8")).hexdigest(), purpose=purpose
+        )
         return jsonify({
             "status": "error",
             "message": f"Could not resend email to {email}: {smtp_msg}. Please request a fresh code after email delivery is configured."
@@ -2605,7 +2798,7 @@ def auth_login():
     registered = db.get("registered_users", {})
 
     # MariaDB is the only source used to authenticate credentials.
-    rel_user, rel_err = db_mgr.verify_user_login(identifier, password)
+    rel_user, token, rel_err = db_mgr.authenticate_and_create_session(identifier, password)
     if not rel_user:
         return jsonify({
             "status": "error",
@@ -2633,7 +2826,6 @@ def auth_login():
 
 
         user_id = matched_user.get("id") or f"usr_{identifier.replace('@', '_').replace('.', '_')}"
-        token = db_mgr.create_session(user_id)
         user_role = matched_user.get("role", "student")
 
         if user_role == "parent":
@@ -2835,7 +3027,9 @@ def forgot_send_otp():
 
     # Never return OTPs through an API response, including in development. This
     # prevents accidental exposure in browser logs, proxies, and client telemetry.
-    verification_codes.pop(email, None)
+    verification_codes.pop(
+        email, None, code_digest=hashlib.sha256(otp.encode("utf-8")).hexdigest(), purpose="forgot"
+    )
     return jsonify({
         "status": "error",
         "message": "Could not send the reset email. Please try again later."
@@ -2872,18 +3066,19 @@ def forgot_verify_otp():
             "status": "error",
             "message": "No pending password reset found for this email."
         }), 400
+    expected_code_hash = _otp_record_digest(record)
 
     try:
         expires_at = datetime.datetime.fromisoformat(record["expires_at"])
     except (KeyError, ValueError, TypeError):
-        verification_codes.pop(email, None)
+        verification_codes.pop(email, None, code_digest=expected_code_hash, purpose="forgot")
         return jsonify({
             "status": "error",
             "message": "Verification code is invalid or expired. Request a new one."
         }), 400
 
     if datetime.datetime.now() > expires_at:
-        verification_codes.pop(email, None)
+        verification_codes.pop(email, None, code_digest=expected_code_hash, purpose="forgot")
         return jsonify({
             "status": "error",
             "message": "Verification code has expired. Request a new one."
@@ -2891,39 +3086,41 @@ def forgot_verify_otp():
 
     attempts_left = record.get("attempts_left", 5)
     if attempts_left <= 0:
-        verification_codes.pop(email, None)
+        verification_codes.pop(email, None, code_digest=expected_code_hash, purpose="forgot")
         return jsonify({
             "status": "error",
             "message": "Too many incorrect attempts. Request a new code."
         }), 400
 
     submitted_code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-    expected_code_hash = record["code"] if record.get("_code_is_hash") else hashlib.sha256(str(record.get("code", "")).encode("utf-8")).hexdigest()
     if not hmac.compare_digest(str(expected_code_hash), submitted_code_hash):
-        attempts_left = verification_codes.decrement_attempts(email)
+        attempts_left = verification_codes.decrement_attempts(
+            email, expected_code_hash, "forgot"
+        )
         if attempts_left <= 0:
-            verification_codes.pop(email, None)
+            verification_codes.pop(
+                email, None, code_digest=expected_code_hash, purpose="forgot"
+            )
         return jsonify({
             "status": "error",
             "message": f"Incorrect verification code. {attempts_left} attempt(s) remaining."
         }), 400
 
+    consumed_record = verification_codes.consume(email, "forgot", submitted_code_hash)
+    if not consumed_record:
+        return jsonify({"status": "error", "message": "Verification code is invalid, expired, or already used. Request a new code."}), 400
+
     try:
         user = db_mgr.get_user_by_email(email)
         if not user:
-            verification_codes.pop(email, None)
             return jsonify({
                 "status": "error",
                 "message": "No MariaDB account exists for this email. Please register first."
             }), 400
 
-        db_mgr.update_user_password(email, new_password)
-
-        # Invalidate existing login sessions after a password reset.
-        db_mgr.execute(
-            "DELETE FROM sessions WHERE user_id = %s",
-            (user["id"],)
-        )
+        # Credential replacement and session revocation share one transaction so
+        # an interrupted reset cannot leave old authenticated sessions active.
+        db_mgr.reset_user_password_and_revoke_sessions(user["id"], new_password)
     except Exception:
         app.logger.exception("MariaDB password reset failed")
         return jsonify({
@@ -2931,7 +3128,6 @@ def forgot_verify_otp():
             "message": "Password reset failed. Please try again."
         }), 500
 
-    verification_codes.pop(email, None)
     return jsonify({
         "status": "success",
         "message": "Password updated successfully. Please sign in with your new password."
@@ -3881,7 +4077,13 @@ def update_grade_target():
         return jsonify({"status": "error", "message": "A valid target_grade is required."}), 400
 
     try:
-        updated = db_mgr.set_subject_target(user["id"], sub_id, target.strip())
+        academic_revision = _parse_data_revision(data.get("academic_revision"))
+    except ValueError:
+        return jsonify({"status": "error", "code": "revision_required", "message": "Reload your academic state before changing subject targets."}), 428
+    try:
+        updated, saved_versions = db_mgr.set_subject_target(user["id"], sub_id, target.strip(), academic_revision)
+    except ConcurrentUpdateError as exc:
+        return jsonify({"status": "error", "code": "stale_revision", "message": str(exc)}), 409
     except Exception:
         app.logger.exception("Failed to update subject target")
         return jsonify({"status": "error", "message": "Could not update target. Please retry."}), 503
@@ -3896,7 +4098,8 @@ def update_grade_target():
     except Exception:
         app.logger.warning("Target saved relationally, but compatibility state could not be updated.", exc_info=True)
 
-    return jsonify({"status": "success", "message": "Subject target updated."})
+    return jsonify({"status": "success", "message": "Subject target updated.",
+                    **saved_versions})
 
 
 @app.route("/api/grades/delete", methods=["POST"])
@@ -3949,7 +4152,11 @@ def add_new_exam():
     title = (data.get("title") or "").strip()
     if not title:
         return jsonify({"status": "error", "message": "Exam title is required"}), 400
-    e_id = db_mgr.add_exam(user["id"], data)
+    try:
+        e_id = db_mgr.add_exam(user["id"], data)
+    except Exception:
+        app.logger.exception("Failed to save exam for signed-in student")
+        return jsonify({"status": "error", "message": "Exam could not be saved. Please retry."}), 503
     return jsonify({"status": "success", "message": "Exam scheduled successfully", "exam_id": e_id, "exam": {"id": e_id, **data}})
 
 @app.route("/api/exams/delete", methods=["POST", "DELETE"])
@@ -3961,7 +4168,13 @@ def delete_exam():
     e_id = data.get("exam_id") or data.get("id")
     if not e_id:
         return jsonify({"status": "error", "message": "Exam ID is required"}), 400
-    db_mgr.delete_exam(user["id"], e_id)
+    try:
+        deleted = db_mgr.delete_exam(user["id"], e_id)
+    except Exception:
+        app.logger.exception("Failed to delete exam for signed-in student")
+        return jsonify({"status": "error", "message": "Exam deletion is temporarily unavailable."}), 503
+    if not deleted:
+        return jsonify({"status": "error", "message": "Exam not found for the signed-in student."}), 404
     return jsonify({"status": "success", "message": "Exam deleted successfully"})
 
 @app.route("/api/goals", methods=["GET"])
@@ -3981,7 +4194,11 @@ def add_new_goal():
     title = (data.get("title") or "").strip()
     if not title:
         return jsonify({"status": "error", "message": "Goal title is required"}), 400
-    g_id = db_mgr.add_goal(user["id"], data)
+    try:
+        g_id = db_mgr.add_goal(user["id"], data)
+    except Exception:
+        app.logger.exception("Failed to save goal for signed-in student")
+        return jsonify({"status": "error", "message": "Goal could not be saved. Please retry."}), 503
     return jsonify({"status": "success", "message": "Goal saved successfully", "goal_id": g_id, "goal": {"id": g_id, **data}})
 
 @app.route("/api/goals/delete", methods=["POST", "DELETE"])
@@ -3993,7 +4210,13 @@ def delete_goal():
     g_id = data.get("goal_id") or data.get("id")
     if not g_id:
         return jsonify({"status": "error", "message": "Goal ID is required"}), 400
-    db_mgr.delete_goal(user["id"], g_id)
+    try:
+        deleted = db_mgr.delete_goal(user["id"], g_id)
+    except Exception:
+        app.logger.exception("Failed to delete goal for signed-in student")
+        return jsonify({"status": "error", "message": "Goal deletion is temporarily unavailable."}), 503
+    if not deleted:
+        return jsonify({"status": "error", "message": "Goal not found for the signed-in student."}), 404
     return jsonify({"status": "success", "message": "Goal deleted successfully"})
 
 # --- VERCEL DUAL ROUTE ALIASING ---
@@ -4032,11 +4255,19 @@ def vercel_serverless_gateway():
     for try_path in [target_api, target_raw]:
         try:
             endpoint, values = adapter.match(try_path, method=request.method)
-            # Avoid infinite recursion
-            if endpoint not in ("vercel_serverless_gateway", "static"):
-                return app.view_functions[endpoint](**values)
         except Exception:
             continue
+        # Avoid infinite recursion and keep handler exceptions in Flask's normal
+        # error path. A selected mutating handler must never be dispatched twice.
+        if endpoint not in ("vercel_serverless_gateway", "static"):
+            base_endpoint = endpoint[:-6] if endpoint.endswith("_alias") else endpoint
+            if base_endpoint not in _PUBLIC_API_ENDPOINTS:
+                user = get_auth_user(request)
+                if not user:
+                    return jsonify({"status": "error", "message": "Authentication required. Please sign in."}), 401
+                if not endpoint_role_allowed(base_endpoint, user.get("role")):
+                    return jsonify({"status": "error", "message": "A signed-in student session is required."}), 403
+            return app.view_functions[endpoint](**values)
 
     return jsonify({
         "status": "error",

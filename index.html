@@ -265,6 +265,7 @@
         subject_breakdown: [],
         grades: []
       });
+      const [subjectTargetDrafts, setSubjectTargetDrafts] = useState({});
       const [isEditingSubjectTargets, setIsEditingSubjectTargets] = useState(false);
       const [showRecordGradeModal, setShowRecordGradeModal] = useState(false);
       const [gradeSubjectId, setGradeSubjectId] = useState("");
@@ -1181,6 +1182,41 @@
         }
       };
 
+      // Refresh only concurrency tokens after a stale-write response. A full
+      // fetchState would replace the user's in-progress academic form draft.
+      const refreshRevisionTokens = async () => {
+        const email = localStorage.getItem("twinstudy_user_email") || state?.user?.email || "";
+        const token = localStorage.getItem("twinstudy_auth_token") || "";
+        const url = email ? `/api/state?email=${encodeURIComponent(email)}` : "/api/state";
+        const response = await fetch(url, {
+          headers: {
+            ...(token ? { "Authorization": `Bearer ${token}` } : {}),
+            ...(email ? { "x-user-email": email } : {})
+          }
+        });
+        if (!response.ok) return false;
+        const latest = await response.json();
+        if (!Number.isInteger(latest.academic_revision) || !Number.isInteger(latest.calendar_revision)) return false;
+        setState(previous => ({
+          ...previous,
+          academic_revision: latest.academic_revision,
+          calendar_revision: latest.calendar_revision
+        }));
+        return true;
+      };
+
+      const notifyStaleDraft = async (draftLabel) => {
+        let refreshed = false;
+        try {
+          refreshed = await refreshRevisionTokens();
+        } catch (error) {
+          // Keep the current draft even if its revision token could not refresh.
+        }
+        showNotification(refreshed
+          ? `${draftLabel} was not saved because the data changed elsewhere. Your draft is still here; review it and save again.`
+          : `${draftLabel} was not saved because the data changed elsewhere. Your draft is still here; reload before saving again.`);
+      };
+
       // ---------------- PARENT & GUARDIAN SYSTEM HANDLERS ----------------
       const fetchStudentParentSettings = async () => {
         try {
@@ -1326,6 +1362,8 @@
       };
 
       const handleUpdateSubjectTarget = async (subjectId, targetGrade) => {
+        const targetDraftKey = `${state?.user?.id || ""}:${subjectId}`;
+        setSubjectTargetDrafts(prev => ({ ...prev, [targetDraftKey]: targetGrade }));
         const token = localStorage.getItem("twinstudy_auth_token");
         const email = localStorage.getItem("twinstudy_user_email") || state?.user?.email || "";
         try {
@@ -1336,14 +1374,39 @@
               ...(token ? { "Authorization": `Bearer ${token}` } : {}),
               ...(email ? { "x-user-email": email } : {})
             },
-            body: JSON.stringify({ subject_id: subjectId, target_grade: targetGrade })
+            body: JSON.stringify({
+              subject_id: subjectId,
+              target_grade: targetGrade,
+              academic_revision: state?.academic_revision
+            })
           });
           const data = await res.json();
           if (!res.ok || data.status !== "success") {
-            showNotification(data.message || "Could not update this subject target.");
+            if (res.status === 409 && data.code === "stale_revision") {
+              await notifyStaleDraft("Subject target");
+            } else {
+              showNotification(data.message || "Could not update this subject target.");
+            }
             await fetchGrades();
             return;
           }
+          setSubjectTargetDrafts(prev => {
+            const next = { ...prev };
+            delete next[targetDraftKey];
+            return next;
+          });
+          const updatedSubjects = (state?.subjects || []).map(subject =>
+            subject.id === subjectId ? { ...subject, target_grade: targetGrade } : subject
+          );
+          setSubjectsList(prev => prev.map(subject =>
+            subject.id === subjectId ? { ...subject, target_grade: targetGrade } : subject
+          ));
+          setState(prev => ({
+            ...prev,
+            subjects: updatedSubjects,
+            academic_revision: data.academic_revision,
+            calendar_revision: data.calendar_revision
+          }));
           await fetchGrades();
           showNotification("Subject target saved.");
         } catch (e) {
@@ -1878,6 +1941,7 @@
             },
             body: JSON.stringify({
               email: userEmail,
+              academic_revision: state?.academic_revision,
               name: settingsName,
               semester: settingsSemester,
               course: settingsCourse,
@@ -1900,7 +1964,11 @@
             }));
             await fetchState();
           } else {
-            showNotification(data.message || "Failed to save profile.");
+            if (res.status === 409 && data.code === "stale_revision") {
+              await notifyStaleDraft("Profile settings");
+            } else {
+              showNotification(data.message || "Failed to save profile.");
+            }
           }
         } catch (e) {
           showNotification("Error updating settings.");
@@ -2419,13 +2487,18 @@
               },
               body: JSON.stringify({
                 email: studentEmail,
+                calendar_revision: state?.calendar_revision,
                 calendar_events: importedCalendarEvents,
                 calendar_exams: importedCalendarExams
               })
             });
             const calendarResult = await calendarResponse.json();
             if (!calendarResponse.ok || calendarResult.status !== "success") {
-              showNotification(calendarResult.message || "Calendar was added to setup but could not be saved.");
+              if (calendarResponse.status === 409 && calendarResult.code === "stale_revision") {
+                await notifyStaleDraft("Calendar changes");
+              } else {
+                showNotification(calendarResult.message || "Calendar was added to setup but could not be saved.");
+              }
               return;
             }
             showNotification(`Academic calendar saved: ${calendarResult.event_count} events and ${calendarResult.exam_count} exams.`);
@@ -2472,6 +2545,8 @@
             body: JSON.stringify({
               email: userEmail,
               academic_profile: academicProfile,
+              academic_revision: state?.academic_revision,
+              calendar_revision: state?.calendar_revision,
               subjects: subjectsList,
               classes: classesList,
               calendar_events: extractedCalendarEventsPending.length
@@ -2495,7 +2570,11 @@
             setShowSetupModal(false);
             await fetchState();
           } else {
-            showNotification(data.message || "Failed to save profile.");
+            if (res.status === 409 && data.code === "stale_revision") {
+              await notifyStaleDraft("Academic setup");
+            } else {
+              showNotification(data.message || "Failed to save profile.");
+            }
           }
         } catch (e) {
           showNotification("Error connecting to server.");
@@ -4900,7 +4979,7 @@
                                     Target:
                                     {isEditingSubjectTargets ? (
                                       <select
-                                        value={s.target_grade || "A"}
+                                        value={subjectTargetDrafts[`${state?.user?.id || ""}:${s.subject_id}`] ?? s.target_grade ?? "A"}
                                         onChange={(e) => handleUpdateSubjectTarget(s.subject_id, e.target.value)}
                                         className="bg-transparent font-bold text-cyanHover focus:outline-none"
                                       >
@@ -5545,7 +5624,7 @@
                         <div className="flex flex-wrap items-center gap-2 text-xs">
                           <span className="px-3 py-1.5 rounded-xl bg-emerald-100 text-emerald-800 font-bold flex items-center gap-1.5 shadow-2xs">
                             <span>●</span>
-                            <span>{parentDashboardData.overview?.academic_status || "Consistent & on track"}</span>
+                              <span>{parentDashboardData.overview?.academic_status || "Activity summary unavailable"}</span>
                           </span>
                         </div>
                       </div>
@@ -5556,36 +5635,36 @@
                           <span className="text-[10px] text-navySlate/60 font-bold uppercase tracking-wider block">Current Study Streak</span>
                           <div className="text-xl font-extrabold text-navySlate flex items-center gap-1.5">
                             <span>🔥</span>
-                            <span>{parentDashboardData.overview?.current_streak || 6} Days</span>
+                            <span>{parentDashboardData.consistency?.permitted === false ? "Private" : `${parentDashboardData.overview?.current_streak ?? 0} Days`}</span>
                           </div>
-                          <span className="text-[10px] text-emerald-700 font-bold">Active Daily Habit</span>
+                          <span className="text-[10px] text-emerald-700 font-bold">{parentDashboardData.consistency?.permitted === false ? "Restricted by student" : "Recorded study streak"}</span>
                         </div>
 
                         <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs space-y-1">
                           <span className="text-[10px] text-navySlate/60 font-bold uppercase tracking-wider block">Weekly Focused Study</span>
                           <div className="text-xl font-extrabold text-navySlate flex items-center gap-1.5">
                             <span>⏱️</span>
-                            <span>{parentDashboardData.overview?.weekly_study_time || "14h 35m"}</span>
+                            <span>{parentDashboardData.weekly_study_time?.permitted === false ? "Private" : (parentDashboardData.overview?.weekly_study_time ?? "0h 0m")}</span>
                           </div>
-                          <span className="text-[10px] text-cyanHover font-bold">+23% vs Previous Week</span>
+                          <span className="text-[10px] text-cyanHover font-bold">{parentDashboardData.weekly_study_time?.permitted === false ? "Restricted by student" : "Recorded this week"}</span>
                         </div>
 
                         <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs space-y-1">
                           <span className="text-[10px] text-navySlate/60 font-bold uppercase tracking-wider block">Assignments & Tasks</span>
                           <div className="text-xl font-extrabold text-navySlate flex items-center gap-1.5">
                             <span>✅</span>
-                            <span>{parentDashboardData.overview?.tasks_completed_ratio || "18/22"}</span>
+                            <span>{parentDashboardData.task_progress?.permitted === false ? "Private" : (parentDashboardData.overview?.tasks_completed_ratio ?? "0/0")}</span>
                           </div>
-                          <span className="text-[10px] text-emerald-700 font-bold">{parentDashboardData.overview?.tasks_completed_pct || 82}% Completed</span>
+                          <span className="text-[10px] text-emerald-700 font-bold">{parentDashboardData.task_progress?.permitted === false ? "Restricted by student" : `${parentDashboardData.overview?.tasks_completed_pct ?? 0}% Completed`}</span>
                         </div>
 
                         <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs space-y-1">
                           <span className="text-[10px] text-navySlate/60 font-bold uppercase tracking-wider block">Next Examination</span>
                           <div className="text-xl font-extrabold text-navySlate flex items-center gap-1.5">
                             <span>📅</span>
-                            <span>In {parentDashboardData.overview?.upcoming_exam_days || 12} Days</span>
+                            <span>{parentDashboardData.upcoming_exams?.permitted === false ? "Private" : (parentDashboardData.overview?.upcoming_exam_days == null ? "No upcoming exam" : `In ${parentDashboardData.overview.upcoming_exam_days} Days`)}</span>
                           </div>
-                          <span className="text-[10px] text-amber-700 font-bold">Data Structures & Algo</span>
+                          <span className="text-[10px] text-amber-700 font-bold">{parentDashboardData.upcoming_exams?.permitted === false ? "Restricted by student" : "Upcoming examination"}</span>
                         </div>
                       </div>
                     </div>
@@ -5742,7 +5821,7 @@
                                 <p className="text-xs text-navySlate/70">Verified coursework, problem sets, and lab practical progress.</p>
                               </div>
                               <span className="px-3 py-1 rounded-xl bg-cyanAccent/20 text-cyanHover text-xs font-extrabold">
-                                {parentDashboardData.task_progress?.progress_percent || 82}% Overall Completed
+                                {parentDashboardData.task_progress?.progress_percent ?? 0}% Overall Completed
                               </span>
                             </div>
 
@@ -5751,21 +5830,21 @@
                               <div className="w-full bg-navySlate/10 h-3 rounded-full overflow-hidden">
                                 <div
                                   className="h-full bg-cyanAccent rounded-full transition-all duration-500"
-                                  style={{ width: `${parentDashboardData.task_progress?.progress_percent || 82}%` }}
+                                  style={{ width: `${parentDashboardData.task_progress?.progress_percent ?? 0}%` }}
                                 ></div>
                               </div>
                               <div className="flex flex-wrap gap-2 text-xs pt-1">
                                 <span className="px-2.5 py-1 rounded-lg bg-white border border-navySlate/10 font-bold text-navySlate">
-                                  Total Tasks: {parentDashboardData.task_progress?.total || 22}
+                                  Total Tasks: {parentDashboardData.task_progress?.total ?? 0}
                                 </span>
                                 <span className="px-2.5 py-1 rounded-lg bg-emerald-100 text-emerald-800 font-bold">
-                                  ✓ Completed: {parentDashboardData.task_progress?.completed || 18}
+                                  ✓ Completed: {parentDashboardData.task_progress?.completed ?? 0}
                                 </span>
                                 <span className="px-2.5 py-1 rounded-lg bg-amber-100 text-amber-800 font-bold">
-                                  ⏳ Pending: {parentDashboardData.task_progress?.pending || 3}
+                                  ⏳ Pending: {parentDashboardData.task_progress?.pending ?? 0}
                                 </span>
                                 <span className="px-2.5 py-1 rounded-lg bg-rose-100 text-rose-700 font-bold">
-                                  ⚠️ Overdue: {parentDashboardData.task_progress?.overdue || 1}
+                                  ⚠️ Overdue: {parentDashboardData.task_progress?.overdue ?? 0}
                                 </span>
                               </div>
                             </div>
@@ -5820,10 +5899,10 @@
                               </div>
                               <div className="text-right">
                                 <div className="text-lg font-black text-navySlate">
-                                  {parentDashboardData.weekly_study_time?.total_hours || "14h 35m"}
+                                  {parentDashboardData.weekly_study_time?.permitted === false ? "Private" : (parentDashboardData.weekly_study_time?.total_this_week ?? "0h 0m")}
                                 </div>
                                 <span className="text-[10px] text-emerald-700 font-extrabold">
-                                  {parentDashboardData.weekly_study_time?.vs_last_week || "+23% increase vs last week"}
+                                  {parentDashboardData.weekly_study_time?.permitted === false ? "Restricted by student" : "Recorded study time"}
                                 </span>
                               </div>
                             </div>
@@ -5879,7 +5958,7 @@
                                 <p className="text-xs text-navySlate/70">Continuous learning momentum and 7-day study consistency matrix.</p>
                               </div>
                               <span className="px-3 py-1 rounded-xl bg-emerald-100 text-emerald-800 text-xs font-extrabold">
-                                {parentDashboardData.consistency?.consistency_score || 92}% Consistency Rating
+                                {parentDashboardData.consistency?.permitted === false ? "Private" : "Recorded consistency"}
                               </span>
                             </div>
 
@@ -5888,19 +5967,19 @@
                               <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs">
                                 <span className="text-[10px] text-navySlate/60 font-bold uppercase block">Current Active Streak</span>
                                 <div className="text-2xl font-black text-navySlate mt-1">
-                                  🔥 {parentDashboardData.consistency?.current_streak || 6} Days
+                                  🔥 {parentDashboardData.consistency?.current_streak ?? 0} Days
                                 </div>
                               </div>
                               <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs">
                                 <span className="text-[10px] text-navySlate/60 font-bold uppercase block">Longest Record Streak</span>
                                 <div className="text-2xl font-black text-navySlate mt-1">
-                                  🏆 {parentDashboardData.consistency?.longest_streak || 14} Days
+                                  🏆 {parentDashboardData.consistency?.longest_streak ?? "Not available"} Days
                                 </div>
                               </div>
                               <div className="p-3.5 bg-white rounded-2xl border border-navySlate/10 shadow-xs">
                                 <span className="text-[10px] text-navySlate/60 font-bold uppercase block">Monthly Progress Rate</span>
                                 <div className="text-2xl font-black text-emerald-700 mt-1">
-                                  📈 +40% vs Baseline
+                                  Not available
                                 </div>
                               </div>
                             </div>
@@ -5916,17 +5995,17 @@
                                   <div
                                     key={h.day}
                                     className={`p-3 rounded-xl border flex flex-col justify-between h-20 transition ${
-                                      h.duration_hours >= 2.5
+                                      h.hours >= 2.5
                                         ? "bg-emerald-600 text-white border-emerald-700"
-                                        : h.duration_hours >= 1.5
+                                        : h.hours >= 1.5
                                         ? "bg-emerald-400 text-white border-emerald-500"
-                                        : h.duration_hours > 0
+                                        : (h.hours > 0 || h.studied)
                                         ? "bg-emerald-100 text-emerald-900 border-emerald-200"
                                         : "bg-slate-100 text-slate-500 border-slate-200"
                                     }`}
                                   >
                                     <span className="font-black text-[10px] uppercase">{h.day.slice(0, 3)}</span>
-                                    <span className="text-xs font-bold">{h.duration_hours > 0 ? `${h.duration_hours}h` : "Rest"}</span>
+                                    <span className="text-xs font-bold">{h.studied != null ? (h.studied ? "Studied" : "Rest") : (h.hours > 0 ? `${h.hours}h` : "Rest")}</span>
                                   </div>
                                 ))}
                               </div>

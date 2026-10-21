@@ -11,9 +11,14 @@ import uuid
 import datetime
 import urllib.parse
 import sqlite3
+import secrets
 import pymysql
 from pymysql.cursors import DictCursor
 from werkzeug.security import generate_password_hash, check_password_hash
+
+
+class ConcurrentUpdateError(RuntimeError):
+    """A submitted academic collection was based on an older saved revision."""
 
 # -----------------------------------------------------------------------------
 # Configuration from Environment
@@ -498,6 +503,14 @@ class DatabaseManager:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS user_data_versions (
+                user_id VARCHAR(64) PRIMARY KEY,
+                academic_version BIGINT NOT NULL DEFAULT 1,
+                calendar_version BIGINT NOT NULL DEFAULT 1,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
             CREATE TABLE IF NOT EXISTS application_state (
                 state_key VARCHAR(64) PRIMARY KEY,
                 state_json LONGTEXT NOT NULL,
@@ -646,202 +659,11 @@ class DatabaseManager:
             print(f"[DB] Notice during column migration: {e}")
 
     def migrate_from_json_if_needed(self):
-        """Seeds the relational database from twin_database.json if users table is empty."""
-        user_count = self.fetchone("SELECT COUNT(*) as cnt FROM users")
-        cnt = (user_count.get("cnt") if user_count else 0) or 0
-        if cnt > 0:
-            return  # Already seeded
-
-        if not os.path.exists(LEGACY_JSON_PATH):
-            return
-
-        try:
-            with open(LEGACY_JSON_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"[DB] Error loading legacy JSON for migration: {e}")
-            return
-
-        print("[DB] Migrating data from twin_database.json to relational database...")
-        registered = data.get("registered_users", {})
-
-        root_user = data.get("user", {})
-        if root_user and root_user.get("email"):
-            r_email = root_user.get("email").strip().lower()
-            if r_email not in [k.lower() for k in registered.keys()]:
-                registered[r_email] = root_user
-
-
-        for email, udata in registered.items():
-            u_id = udata.get("id") or f"usr_{uuid.uuid4().hex[:12]}"
-            pwd = udata.get("password")
-            if not pwd:
-                # Do not create a login account from incomplete legacy data.
-                continue
-            pwd_hash = generate_password_hash(pwd) if not pwd.startswith("scrypt:") and not pwd.startswith("pbkdf2:") else pwd
-
-            self.execute("""
-                INSERT IGNORE INTO users (
-                    id, email, password_hash, name, role, dob, age, is_minor,
-                    points, streak_days, daily_study_hours, focus_duration_minutes,
-                    learning_preference, preferred_study_time, college, grade_level,
-                    guardian_email, linking_code
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                u_id,
-                email.strip().lower(),
-                pwd_hash,
-                udata.get("name", "Student"),
-                udata.get("role", "student"),
-                udata.get("dob", ""),
-                safe_int(udata.get("age"), 20),
-                1 if udata.get("is_minor") else 0,
-                safe_int(udata.get("points"), 100),
-                safe_int(udata.get("streak_days"), 1),
-                safe_float(udata.get("daily_study_hours"), 3.0),
-                safe_int(udata.get("focus_duration_minutes"), 45),
-                udata.get("learning_preference", "Practice problems and step-by-step review"),
-                udata.get("preferred_study_time", "Evening"),
-                udata.get("college", ""),
-                udata.get("grade_level", ""),
-                udata.get("guardian_email", ""),
-                udata.get("linking_code", "TS-LINK-8921")
-            ))
-
-            prof = udata.get("academic_profile") or data.get("academic_profile", {})
-            self.execute("""
-                INSERT IGNORE INTO student_profiles (
-                    id, user_id, student_name, college, course, semester, specialization, academic_year
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                f"prof_{u_id}",
-                u_id,
-                udata.get("name", "Student"),
-                prof.get("college") or udata.get("college", ""),
-                prof.get("course") or "Computer Science & Engineering",
-                prof.get("semester") or "Semester 6",
-                prof.get("specialization") or "cs",
-                prof.get("academic_year") or "2026-2027"
-            ))
-
-            subj_list = udata.get("subjects") or data.get("subjects", [])
-            for s in subj_list:
-                s_id = s.get("id") or f"sub_{uuid.uuid4().hex[:8]}"
-                self.execute("""
-                    INSERT IGNORE INTO subjects (
-                        id, user_id, name, code, credits, target_percentage, professor, teacher, room, color, type
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    s_id, u_id, s.get("name", "Subject"), s.get("code", "CS101"),
-                    safe_int(s.get("credits"), 3), safe_float(s.get("target_percentage"), 85.0),
-                    s.get("professor", "Faculty"), s.get("teacher", s.get("professor", "Faculty")),
-                    s.get("room", "Room 402"), s.get("color", "#3b82f6"), s.get("type", "Lecture")
-                ))
-
-            class_list = udata.get("classes") or data.get("classes", [])
-            for c in class_list:
-                c_id = c.get("id") or f"cls_{uuid.uuid4().hex[:8]}"
-                s_name = c.get("subject_name") or c.get("subject") or c.get("name", "Class")
-                c_time = c.get("time_slot") or c.get("time", "10:00 - 11:30 AM")
-                c_prof = c.get("professor") or c.get("teacher") or c.get("faculty", "Professor")
-                self.execute("""
-                    INSERT IGNORE INTO classes (
-                        id, user_id, subject_id, subject_name, subject, day, time_slot, time, room, professor, teacher, color, type, week_type
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    c_id, u_id, c.get("subject_id", ""), s_name, s_name,
-                    c.get("day", "Monday"), c_time, c_time,
-                    c.get("room", "Room 402"), c_prof, c_prof,
-                    c.get("color", "#3b82f6"), c.get("type", "Lecture"), c.get("week_type", "All")
-                ))
-
-            task_list = udata.get("tasks") or data.get("tasks", [])
-            for t in task_list:
-                t_id = t.get("id") or f"tsk_{uuid.uuid4().hex[:8]}"
-                self.execute("""
-                    INSERT IGNORE INTO tasks (
-                        id, user_id, subject_id, subject_name, title, description, due_date,
-                        priority, status, points_reward, verified, verified_file, quiz_score, verified_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    t_id, u_id, t.get("subject_id", ""), t.get("subject_name", t.get("subject", "Coursework")),
-                    t.get("title", "Task"), t.get("description", ""), t.get("due_date", "Friday"),
-                    t.get("priority", "medium"), t.get("status", "Pending"),
-                    safe_int(t.get("points_reward", t.get("points")), 100),
-                    1 if t.get("verified") else 0,
-                    t.get("verified_file", ""),
-                    t.get("quiz_score", ""),
-                    t.get("verified_at", "")
-                ))
-
-            patterns = data.get("behavior_patterns", [])
-            for p in patterns:
-                p_id = p.get("id") or f"bp_{uuid.uuid4().hex[:8]}"
-                self.execute("""
-                    INSERT IGNORE INTO behavior_patterns (
-                        id, user_id, title, pattern_type, confidence, evidence_count, evidence_summary, weight, is_active
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    p_id, u_id, p.get("title", ""), p.get("pattern_type", "prioritization"),
-                    safe_float(p.get("confidence"), 85.0), safe_int(p.get("evidence_count"), 5),
-                    p.get("evidence_summary", ""), safe_float(p.get("weight"), 1.0),
-                    1 if p.get("is_active", True) else 0
-                ))
-
-            exam_list = udata.get("exams") or data.get("exams", [])
-            for ex in exam_list:
-                ex_id = ex.get("id") or f"ex_{uuid.uuid4().hex[:8]}"
-                self.execute("""
-                    INSERT IGNORE INTO exams (
-                        id, user_id, subject_id, subject_name, title, exam_date, weight_pct, target_score, syllabus_summary
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    ex_id, u_id, ex.get("subject_id", ""), ex.get("subject_name", ex.get("subject", "Midterm")),
-                    ex.get("title", "Exam"), ex.get("exam_date", ex.get("date", "2026-10-15")),
-                    safe_float(ex.get("weight_pct", ex.get("weight", 30.0)), 30.0),
-                    safe_float(ex.get("target_score", 85.0), 85.0),
-                    ex.get("syllabus_summary", ex.get("syllabus", ""))
-                ))
-
-            grade_list = udata.get("grades") or data.get("grades", [])
-            for gr in grade_list:
-                gr_id = gr.get("id") or f"gr_{uuid.uuid4().hex[:8]}"
-                self.execute("""
-                    INSERT IGNORE INTO grades (
-                        id, user_id, subject_id, subject_name, assessment_type, title, marks_obtained, max_marks, percentage, grade, term
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (
-                    gr_id, u_id, gr.get("subject_id", ""), gr.get("subject_name", gr.get("subject", "Module")),
-                    gr.get("assessment_type", gr.get("type", "Assignment")),
-                    gr.get("title", "Test"),
-                    safe_float(gr.get("marks_obtained", gr.get("score", 85.0)), 85.0),
-                    safe_float(gr.get("max_marks", 100.0), 100.0),
-                    safe_float(gr.get("percentage", 85.0), 85.0),
-                    gr.get("grade", "A"),
-                    gr.get("term", "Semester 6")
-                ))
-
-            p_ctrl = udata.get("parent_controls") or data.get("parent_controls", {})
-            self.execute("""
-                INSERT IGNORE INTO permissions (
-                    id, user_id, guardian_email, allow_view_study_hours, allow_view_proofs, allow_nudges, approved
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                f"perm_{u_id}", u_id,
-                p_ctrl.get("guardian_email", ""),
-                1 if p_ctrl.get("allow_view_study_hours", True) else 0,
-                1 if p_ctrl.get("allow_view_proofs", True) else 0,
-                1 if p_ctrl.get("allow_nudges", True) else 0,
-                1 if p_ctrl.get("guardian_approved", False) else 0
-            ))
-
-            # Privacy settings
-            self.execute("""
-                INSERT IGNORE INTO privacy_settings (user_id, academic_calendar, biometric_telemetry, parent_live_nudges, allow_research_benchmarking)
-                VALUES (%s, 1, 1, 1, 0)
-            """, (u_id,))
-
-        print("[DB] Initial migration from JSON completed successfully.")
+        """Fail closed until a protected, validated migration runner exists."""
+        raise RuntimeError(
+            "Legacy JSON migration is disabled. Use a reviewed runner with a dry run, "
+            "verified backup/restore, and duplicate-safe inserts against an isolated copy."
+        )
 
     # -------------------------------------------------------------------------
     # USER & AUTHENTICATION METHODS
@@ -935,11 +757,98 @@ class DatabaseManager:
 
         return user, None
 
+    def authenticate_and_create_session(self, identifier: str, password: str):
+        """Verify credentials and create their session under the account-row lock.
+
+        A password reset updates the same row before revoking sessions. Serializing
+        both operations means a stale-password login cannot insert its session
+        after reset has completed.
+        """
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            suffix = " FOR UPDATE" if self.engine_type == "mysql" else ""
+            cur.execute(self._translate_query(
+                "SELECT * FROM users WHERE LOWER(email)=LOWER(%s) LIMIT 1" + suffix
+            ), (str(identifier).strip(),))
+            row = cur.fetchone()
+            if not row:
+                cur.execute(self._translate_query(
+                    "SELECT * FROM users WHERE UPPER(linking_code)=UPPER(%s) LIMIT 1" + suffix
+                ), (str(identifier).strip(),))
+                row = cur.fetchone()
+            user = dict(row) if row and not isinstance(row, dict) else row
+            if not user:
+                conn.rollback()
+                return None, None, "No account found with this email address."
+
+            stored_hash = user.get("password_hash", "")
+            if stored_hash.startswith(("scrypt:", "pbkdf2:")):
+                if not check_password_hash(stored_hash, password):
+                    conn.rollback()
+                    return None, None, "Incorrect password. Please try again."
+            else:
+                if stored_hash != password:
+                    conn.rollback()
+                    return None, None, "Incorrect password. Please try again."
+                stored_hash = generate_password_hash(password)
+                cur.execute(self._translate_query(
+                    "UPDATE users SET password_hash=%s WHERE id=%s"
+                ), (stored_hash, user["id"]))
+                user["password_hash"] = stored_hash
+
+            token = f"tws_{uuid.uuid4().hex}_{int(datetime.datetime.now().timestamp())}"
+            expires_at = datetime.datetime.now() + datetime.timedelta(days=30)
+            cur.execute(self._translate_query(
+                "INSERT INTO sessions (token,user_id,expires_at) VALUES (%s,%s,%s)"
+            ), (token, user["id"], expires_at.strftime("%Y-%m-%d %H:%M:%S")))
+            conn.commit()
+            return user, token, None
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def update_user_password(self, email: str, new_password: str):
         email_clean = email.strip().lower()
         new_hash = generate_password_hash(new_password)
         self.execute("UPDATE users SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE LOWER(email) = LOWER(%s)", (new_hash, email_clean))
         return True
+
+    def reset_user_password_and_revoke_sessions(self, user_id: str, new_password: str):
+        """Update credentials and revoke every active session atomically."""
+        new_hash = generate_password_hash(new_password)
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            cur.execute(self._translate_query(
+                "UPDATE users SET password_hash=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s"
+            ), (new_hash, user_id))
+            if cur.rowcount != 1:
+                raise ValueError("Password reset account no longer exists")
+            cur.execute(self._translate_query("DELETE FROM sessions WHERE user_id=%s"), (user_id,))
+            conn.commit()
+            return True
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def create_session(self, user_id: str):
         token = f"tws_{uuid.uuid4().hex}_{int(datetime.datetime.now().timestamp())}"
@@ -949,6 +858,15 @@ class DatabaseManager:
             VALUES (%s, %s, %s)
         """, (token, user_id, expires_at.strftime("%Y-%m-%d %H:%M:%S")))
         return token
+
+    def _lock_task_owner(self, cursor, user_id: str):
+        """Lock the same account row used by academic collection replacement."""
+        suffix = " FOR UPDATE" if self.engine_type == "mysql" else ""
+        cursor.execute(self._translate_query(
+            "SELECT id FROM users WHERE id=%s" + suffix
+        ), (user_id,))
+        if not cursor.fetchone():
+            raise ValueError("Student account was not found")
 
     def get_user_by_token(self, token: str):
         if not token:
@@ -979,13 +897,83 @@ class DatabaseManager:
     # -------------------------------------------------------------------------
     # USER-SCOPED DATA ACCESS & ACADEMIC STORAGE
     # -------------------------------------------------------------------------
-    def save_user_academic_state(self, user_id: str, profile: dict, subjects: list, classes: list, tasks: list = None):
-        """Atomically replace one student's normalized profile, subjects, classes and tasks.
+    def get_user_data_versions(self, user_id: str):
+        row = self.fetchone("SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id = %s", (user_id,))
+        return {
+            "academic_revision": int((row or {}).get("academic_version", 1)),
+            "calendar_revision": int((row or {}).get("calendar_version", 1)),
+        }
+
+    def _lock_user_data_versions_for_update(self, cursor, user_id: str):
+        query = "INSERT IGNORE INTO user_data_versions (user_id) VALUES (%s)"
+        cursor.execute(self._translate_query(query), (user_id,))
+        suffix = " FOR UPDATE" if self.engine_type == "mysql" else ""
+        cursor.execute(self._translate_query(
+            f"SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id = %s{suffix}"
+        ), (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if not isinstance(row, dict) else row
+
+    def _lock_user_data_versions(self, cursor, user_id: str, expected_column: str, expected_revision: int):
+        if expected_column not in ("academic_version", "calendar_version"):
+            raise ValueError("Invalid data revision category")
+        row = self._lock_user_data_versions_for_update(cursor, user_id)
+        current = int(row[expected_column])
+        if current != int(expected_revision):
+            raise ConcurrentUpdateError("Saved academic data changed since it was loaded. Reload before saving again.")
+
+    def update_student_profile_fields(self, user_id: str, name: str, dob: str, age: int,
+                                      is_minor: bool, role: str, guardian_email: str,
+                                      daily_hours: float, college: str, grade_level: str,
+                                      course: str, semester: str, expected_revision: int):
+        """Serialize settings-profile writes with academic collection replacement."""
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            self._lock_user_data_versions(cur, user_id, "academic_version", expected_revision)
+            cur.execute(self._translate_query("""UPDATE users
+                SET name=%s,dob=%s,age=%s,is_minor=%s,role=%s,guardian_email=%s,
+                    daily_study_hours=%s,college=%s,grade_level=%s,updated_at=CURRENT_TIMESTAMP
+                WHERE id=%s"""),
+                (name, dob, age, 1 if is_minor else 0, role, guardian_email,
+                 daily_hours, college, grade_level, user_id))
+            user_updated = cur.rowcount > 0
+            cur.execute(self._translate_query("""UPDATE student_profiles
+                SET student_name=%s,college=%s,course=%s,semester=%s WHERE user_id=%s"""),
+                (name, college, course, semester, user_id))
+            profile_updated = cur.rowcount > 0
+            if user_updated or profile_updated:
+                cur.execute(self._translate_query(
+                    "UPDATE user_data_versions SET academic_version=academic_version+1 WHERE user_id=%s"
+                ), (user_id,))
+            cur.execute(self._translate_query(
+                "SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id=%s"
+            ), (user_id,))
+            versions = dict(cur.fetchone())
+            conn.commit()
+            return {"academic_revision": int(versions["academic_version"]),
+                    "calendar_revision": int(versions["calendar_version"])}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def save_user_academic_state(self, user_id: str, profile: dict, subjects: list, classes: list, tasks: list = None, preserve_existing_tasks: bool = False, expected_revision: int = None, calendar_events: list = None, calendar_exams: list = None, expected_calendar_revision: int = None, compatibility_tasks: list = None):
+        """Atomically replace one student's normalized academic and optional calendar data.
 
         Request-supplied identifiers are preserved only when they are not owned by a
         different account. References to subjects outside this submitted student-owned
         subject set are discarded to prevent cross-account foreign-ID references.
-        Returns normalized records containing the identifiers actually stored.
+        Returns normalized records containing the identifiers actually stored. When
+        expected revisions are supplied, a concurrent writer causes a rollback.
         """
         if not user_id:
             raise ValueError("A student user_id is required")
@@ -993,6 +981,12 @@ class DatabaseManager:
             raise ValueError("Profile must be an object and subjects/classes must be lists")
         if tasks is not None and not isinstance(tasks, list):
             raise ValueError("Tasks must be a list")
+        if compatibility_tasks is not None and (not isinstance(compatibility_tasks, list) or len(compatibility_tasks) > 2000):
+            raise ValueError("Compatibility tasks must be a list of at most 2000 records")
+        if calendar_events is not None and (not isinstance(calendar_events, list) or len(calendar_events) > 2000):
+            raise ValueError("Calendar events must be a list of at most 2000 records")
+        if calendar_exams is not None and (not isinstance(calendar_exams, list) or len(calendar_exams) > 1000):
+            raise ValueError("Calendar exams must be a list of at most 1000 records")
         if len(subjects) > 300 or len(classes) > 2000 or (tasks is not None and len(tasks) > 2000):
             raise ValueError("Academic payload exceeds the supported record limit")
 
@@ -1007,6 +1001,12 @@ class DatabaseManager:
             else:
                 conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
+
+            if expected_revision is not None:
+                self._lock_user_data_versions(cur, user_id, "academic_version", expected_revision)
+            if expected_calendar_revision is not None:
+                self._lock_user_data_versions(cur, user_id, "calendar_version", expected_calendar_revision)
+            self._lock_task_owner(cur, user_id)
 
             def execute(sql, params=()):
                 cur.execute(self._translate_query(sql), params)
@@ -1050,6 +1050,20 @@ class DatabaseManager:
             grade_str = f"{p_course} ({p_semester})" if p_course and p_semester else p_course
             execute("UPDATE users SET college=%s, grade_level=%s, name=CASE WHEN %s <> '' THEN %s ELSE name END WHERE id=%s",
                     (p_college, grade_str, p_name, p_name, user_id))
+
+            # Academic-profile saves may include suggested tasks for a new student.
+            # Once any task exists, retain the student's collection unchanged.
+            # The users-row update above serializes same-user saves in MySQL; SQLite
+            # already holds its immediate write lock for this transaction.
+            if tasks is not None and preserve_existing_tasks:
+                existing_task = fetchone("SELECT id FROM tasks WHERE user_id = %s LIMIT 1", (user_id,))
+                if existing_task:
+                    tasks = None
+                elif compatibility_tasks:
+                    # The old JSON-backed application may be the only place the
+                    # student's existing task IDs/progress have been stored.
+                    # Import those under this same transaction before suggestions.
+                    tasks = compatibility_tasks
 
             # Resolve IDs before deleting old rows so identifiers belonging to other
             # students are never reused for this student's replacement records.
@@ -1117,11 +1131,52 @@ class DatabaseManager:
                          str(item.get("quiz_score") or ""), str(item.get("verified_at") or "")))
                     item["subject_id"] = resolved_sid
 
+            if calendar_events is not None:
+                execute("DELETE FROM academic_calendar_events WHERE user_id = %s", (user_id,))
+                for item in calendar_events:
+                    if not isinstance(item, dict):
+                        raise ValueError("Each calendar event must be an object")
+                    item_id = str(item.get("id") or f"evt_{uuid.uuid4().hex[:24]}")[:64]
+                    existing = fetchone("SELECT user_id FROM academic_calendar_events WHERE id = %s", (item_id,))
+                    if existing and str(existing.get("user_id")) != str(user_id):
+                        item_id = f"evt_{uuid.uuid4().hex[:24]}"
+                    title = str(item.get("title") or item.get("name") or "Academic event")[:255]
+                    event_date = str(item.get("date") or item.get("event_date") or "")[:64]
+                    event_type = str(item.get("type") or "event")[:64]
+                    execute("""INSERT INTO academic_calendar_events
+                        (id,user_id,event_date,title,event_type,payload_json) VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (item_id, user_id, event_date, title, event_type, json.dumps(item, ensure_ascii=False)))
+
+            if calendar_exams is not None:
+                execute("DELETE FROM academic_calendar_exams WHERE user_id = %s", (user_id,))
+                for item in calendar_exams:
+                    if not isinstance(item, dict):
+                        raise ValueError("Each calendar exam must be an object")
+                    item_id = str(item.get("id") or f"calex_{uuid.uuid4().hex[:24]}")[:64]
+                    existing = fetchone("SELECT user_id FROM academic_calendar_exams WHERE id = %s", (item_id,))
+                    if existing and str(existing.get("user_id")) != str(user_id):
+                        item_id = f"calex_{uuid.uuid4().hex[:24]}"
+                    exam_date = str(item.get("date") or item.get("exam_date") or "")[:64]
+                    title = str(item.get("title") or item.get("name") or "Exam")[:255]
+                    subject = str(item.get("subject") or item.get("subject_name") or "")[:191]
+                    execute("""INSERT INTO academic_calendar_exams
+                        (id,user_id,exam_date,title,subject_name,payload_json) VALUES (%s,%s,%s,%s,%s,%s)""",
+                        (item_id, user_id, exam_date, title, subject, json.dumps(item, ensure_ascii=False)))
+
+            if expected_revision is not None:
+                execute("UPDATE user_data_versions SET academic_version = academic_version + 1 WHERE user_id = %s", (user_id,))
+            if expected_calendar_revision is not None:
+                execute("UPDATE user_data_versions SET calendar_version = calendar_version + 1 WHERE user_id = %s", (user_id,))
+            versions = None
+            if expected_revision is not None or expected_calendar_revision is not None:
+                versions = fetchone("SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id = %s", (user_id,))
             conn.commit()
             return {"academic_profile": {**profile, "student_name": p_name, "college": p_college, "course": p_course,
                                           "semester": p_semester, "specialization": p_spec, "academic_year": p_year},
                     "subjects": normalized_subjects, "classes": normalized_classes,
-                    "tasks": normalized_tasks if tasks is not None else None}
+                    "tasks": normalized_tasks if tasks is not None else None,
+                    "academic_revision": int(versions["academic_version"]) if versions else None,
+                    "calendar_revision": int(versions["calendar_version"]) if versions else None}
         except Exception:
             try:
                 conn.rollback()
@@ -1131,7 +1186,7 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def save_user_calendar(self, user_id: str, events: list = None, exams: list = None):
+    def save_user_calendar(self, user_id: str, events: list = None, exams: list = None, expected_revision: int = None):
         """Atomically replace supplied calendar collections for the authenticated user."""
         if not user_id:
             raise ValueError("A student user_id is required")
@@ -1148,6 +1203,8 @@ class DatabaseManager:
             cur = conn.cursor()
             def execute(sql, params=()):
                 cur.execute(self._translate_query(sql), params)
+            if expected_revision is not None:
+                self._lock_user_data_versions(cur, user_id, "calendar_version", expected_revision)
             if events is not None:
                 execute("DELETE FROM academic_calendar_events WHERE user_id = %s", (user_id,))
                 for item in events:
@@ -1184,7 +1241,18 @@ class DatabaseManager:
                     execute("""INSERT INTO academic_calendar_exams
                         (id,user_id,exam_date,title,subject_name,payload_json) VALUES (%s,%s,%s,%s,%s,%s)""",
                         (item_id, user_id, ex_date, title, subject, json.dumps(item, ensure_ascii=False)))
+            if expected_revision is not None:
+                execute("UPDATE user_data_versions SET calendar_version = calendar_version + 1 WHERE user_id = %s", (user_id,))
+            versions = None
+            if expected_revision is not None:
+                execute("SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id = %s", (user_id,))
+                row = cur.fetchone()
+                versions = dict(row) if not isinstance(row, dict) else row
             conn.commit()
+            if versions:
+                return {"academic_revision": int(versions["academic_version"]),
+                        "calendar_revision": int(versions["calendar_version"])}
+            return None
         except Exception:
             try:
                 conn.rollback()
@@ -1299,25 +1367,65 @@ class DatabaseManager:
     def add_task(self, user_id: str, task: dict):
         if not user_id or not isinstance(task, dict):
             raise ValueError("A student owner and task object are required")
-        t_id = str(task.get("id") or f"t_{uuid.uuid4().hex[:24]}")[:64]
-        existing = self.fetchone("SELECT user_id FROM tasks WHERE id = %s", (t_id,))
-        if existing and str(existing.get("user_id")) != str(user_id):
-            t_id = f"t_{uuid.uuid4().hex[:24]}"
-        self.execute("""INSERT INTO tasks (
-            id,user_id,subject_id,subject_name,title,description,due_date,priority,status,points_reward,verified
-        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", (
-            t_id, user_id, str(task.get("subject_id") or "")[:64],
-            str(task.get("subject") or task.get("subject_name") or "Coursework")[:191],
-            str(task.get("title") or "Task")[:255], str(task.get("description") or task.get("proof_required") or ""),
-            str(task.get("due_date") or "")[:64], str(task.get("priority") or "High")[:32],
-            str(task.get("status") or "Pending")[:64], safe_int(task.get("points_reward", task.get("points", 100)), 100),
-            1 if task.get("verified") else 0
-        ))
-        return t_id
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            self._lock_task_owner(cur, user_id)
+            t_id = str(task.get("id") or f"t_{uuid.uuid4().hex[:24]}")[:64]
+            cur.execute(self._translate_query("SELECT user_id FROM tasks WHERE id=%s"), (t_id,))
+            existing = cur.fetchone()
+            if existing:
+                existing = dict(existing) if not isinstance(existing, dict) else existing
+                if str(existing.get("user_id")) != str(user_id):
+                    t_id = f"t_{uuid.uuid4().hex[:24]}"
+            cur.execute(self._translate_query("""INSERT INTO tasks (
+                id,user_id,subject_id,subject_name,title,description,due_date,priority,status,points_reward,verified
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"""), (
+                t_id, user_id, str(task.get("subject_id") or "")[:64],
+                str(task.get("subject") or task.get("subject_name") or "Coursework")[:191],
+                str(task.get("title") or "Task")[:255], str(task.get("description") or task.get("proof_required") or ""),
+                str(task.get("due_date") or "")[:64], str(task.get("priority") or "High")[:32],
+                str(task.get("status") or "Pending")[:64], safe_int(task.get("points_reward", task.get("points", 100)), 100),
+                1 if task.get("verified") else 0
+            ))
+            conn.commit()
+            return t_id
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def delete_task(self, user_id: str, task_id: str):
-        cur = self.execute("DELETE FROM tasks WHERE id = %s AND user_id = %s", (task_id, user_id))
-        return getattr(cur, "rowcount", 0) == 1
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            self._lock_task_owner(cur, user_id)
+            cur.execute(self._translate_query(
+                "DELETE FROM tasks WHERE id = %s AND user_id = %s"
+            ), (task_id, user_id))
+            deleted = getattr(cur, "rowcount", 0) == 1
+            conn.commit()
+            return deleted
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def replace_user_tasks(self, user_id: str, tasks: list):
         """Replace a student's task list atomically; every row is scoped to that user."""
@@ -1331,6 +1439,7 @@ class DatabaseManager:
             else:
                 conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
+            self._lock_task_owner(cur, user_id)
             def execute(sql, params=()):
                 cur.execute(self._translate_query(sql), params)
                 return cur
@@ -1375,6 +1484,72 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def add_generated_tasks(self, user_id: str, tasks: list):
+        """Add generated suggestions without replacing or resetting saved tasks.
+
+        The user row lock serializes simultaneous generation requests on MySQL;
+        SQLite's immediate transaction provides the same per-database exclusion.
+        Suggestions with an existing (subject, title) pair are skipped.
+        """
+        if not user_id or not isinstance(tasks, list) or len(tasks) > 2000:
+            raise ValueError("A student user_id and a valid task list are required")
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+
+            def execute(sql, params=()):
+                cur.execute(self._translate_query(sql), params)
+                return cur
+
+            self._lock_task_owner(cur, user_id)
+            execute("SELECT id, subject_name, title FROM tasks WHERE user_id = %s", (user_id,))
+            existing = cur.fetchall()
+            existing_rows = [dict(row) if not isinstance(row, dict) else row for row in existing]
+            keys = {(str(row.get("subject_name") or ""), str(row.get("title") or "")) for row in existing_rows}
+            for raw in tasks:
+                if not isinstance(raw, dict):
+                    raise ValueError("Each task must be an object")
+                item = dict(raw)
+                subject = str(item.get("subject_name") or item.get("subject") or "Coursework")[:191]
+                title = str(item.get("title") or "Task")[:255]
+                if (subject, title) in keys:
+                    continue
+                task_id = str(item.get("id") or f"task_{uuid.uuid4().hex[:24]}")[:64]
+                execute("SELECT user_id FROM tasks WHERE id = %s", (task_id,))
+                found = cur.fetchone()
+                if found:
+                    found_map = dict(found) if not isinstance(found, dict) else found
+                    if str(found_map.get("user_id")) != str(user_id):
+                        task_id = f"task_{uuid.uuid4().hex[:24]}"
+                execute("""INSERT INTO tasks
+                    (id,user_id,subject_id,subject_name,title,description,due_date,priority,status,
+                     points_reward,verified,verified_file,quiz_score,verified_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (task_id, user_id, str(item.get("subject_id") or "")[:64], subject, title,
+                     str(item.get("proof_required") or item.get("description") or ""),
+                     str(item.get("due_date") or "")[:64], str(item.get("priority") or "High")[:32],
+                     str(item.get("status") or "Pending")[:64],
+                     safe_int(item.get("points_reward", item.get("points", 100)), 100),
+                     1 if item.get("verified") else 0, str(item.get("verified_file") or ""),
+                     str(item.get("quiz_score") or ""), str(item.get("verified_at") or "")))
+                item.update({"id": task_id, "subject_name": subject, "title": title})
+                existing_rows.append(item)
+                keys.add((subject, title))
+            conn.commit()
+            return existing_rows
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def get_user_tasks(self, user_id: str):
         return self.fetchall("SELECT * FROM tasks WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
 
@@ -1387,6 +1562,7 @@ class DatabaseManager:
             else:
                 conn.execute("BEGIN IMMEDIATE")
             cur = conn.cursor()
+            self._lock_task_owner(cur, user_id)
             def execute(sql, params=()):
                 cur.execute(self._translate_query(sql), params)
                 return cur
@@ -1470,20 +1646,44 @@ class DatabaseManager:
         return getattr(cur, "rowcount", 0) == 1
 
 
-    def set_subject_target(self, user_id: str, subject_id: str, target: str):
-        cur = self.execute(
-            "UPDATE subjects SET target_grade = %s WHERE id = %s AND user_id = %s",
-            (target, subject_id, user_id)
-        )
-        if getattr(cur, "rowcount", 0) == 1:
-            return True
-
-        # MariaDB may report zero changed rows when the value is unchanged.
-        rows = self.fetchall(
-            "SELECT id FROM subjects WHERE id = %s AND user_id = %s LIMIT 1",
-            (subject_id, user_id),
-        )
-        return bool(rows)
+    def set_subject_target(self, user_id: str, subject_id: str, target: str, expected_revision: int):
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            self._lock_user_data_versions(cur, user_id, "academic_version", expected_revision)
+            cur.execute(self._translate_query(
+                "UPDATE subjects SET target_grade = %s WHERE id = %s AND user_id = %s"
+            ), (target, subject_id, user_id))
+            changed = cur.rowcount == 1
+            if not changed:
+                cur.execute(self._translate_query(
+                    "SELECT id FROM subjects WHERE id = %s AND user_id = %s LIMIT 1"
+                ), (subject_id, user_id))
+                exists = cur.fetchone() is not None
+            else:
+                exists = True
+                cur.execute(self._translate_query(
+                    "UPDATE user_data_versions SET academic_version=academic_version+1 WHERE user_id=%s"
+                ), (user_id,))
+            cur.execute(self._translate_query(
+                "SELECT academic_version, calendar_version FROM user_data_versions WHERE user_id=%s"
+            ), (user_id,))
+            versions = dict(cur.fetchone())
+            conn.commit()
+            return exists, {"academic_revision": int(versions["academic_version"]),
+                             "calendar_revision": int(versions["calendar_version"])}
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     def get_user_grades(self, user_id: str):
         return self.fetchall("SELECT * FROM grades WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
@@ -1844,7 +2044,7 @@ class DatabaseManager:
         # and sometimes plaintext registration payloads. Users can request a new code.
         stored_code = str(row.get("code") or "")
         if len(stored_code) != 64 or any(c not in "0123456789abcdef" for c in stored_code.lower()):
-            self.delete_otp(email)
+            self.delete_otp(email, stored_code, row.get("purpose"))
             return None
         # Fail closed if expiry is missing, malformed, or already elapsed.
         try:
@@ -1854,29 +2054,109 @@ class DatabaseManager:
             else:
                 exp = datetime.datetime.strptime(str(exp_value), "%Y-%m-%d %H:%M:%S")
             if datetime.datetime.now() >= exp:
-                self.delete_otp(email)
+                self.delete_otp(email, stored_code, row.get("purpose"))
                 return None
         except (TypeError, ValueError):
-            self.delete_otp(email)
+            self.delete_otp(email, stored_code, row.get("purpose"))
             return None
         return row
 
-    def decrement_otp_attempts(self, email: str):
+    def decrement_otp_attempts(self, email: str, code_digest: str = None, purpose: str = None):
         """Atomically consume an OTP attempt and return the remaining count."""
         email_clean = str(email or "").strip().lower()
+        conditions = "LOWER(email) = LOWER(%s) AND attempts_left > 0"
+        params = [email_clean]
+        if code_digest is not None:
+            conditions += " AND code = %s"
+            params.append(str(code_digest))
+        if purpose is not None:
+            conditions += " AND purpose = %s"
+            params.append(str(purpose))
         self.execute(
             "UPDATE verification_otps SET attempts_left = CASE WHEN attempts_left > 0 THEN attempts_left - 1 ELSE 0 END "
-            "WHERE LOWER(email) = LOWER(%s) AND attempts_left > 0",
-            (email_clean,),
+            "WHERE " + conditions,
+            tuple(params),
         )
-        row = self.fetchone(
-            "SELECT attempts_left FROM verification_otps WHERE LOWER(email) = LOWER(%s)",
-            (email_clean,),
-        )
+        select_conditions = "LOWER(email) = LOWER(%s)"
+        select_params = [email_clean]
+        if code_digest is not None:
+            select_conditions += " AND code = %s"
+            select_params.append(str(code_digest))
+        if purpose is not None:
+            select_conditions += " AND purpose = %s"
+            select_params.append(str(purpose))
+        row = self.fetchone("SELECT attempts_left FROM verification_otps WHERE " + select_conditions, tuple(select_params))
         return int(row.get("attempts_left", 0)) if row else 0
 
-    def delete_otp(self, email: str):
-        self.execute("DELETE FROM verification_otps WHERE LOWER(email) = LOWER(%s)", (email.strip(),))
+    def consume_otp(self, email: str, purpose: str, code_digest: str):
+        """Atomically validate and consume one unexpired OTP across workers."""
+        email_clean = str(email or "").strip().lower()
+        conn = self.get_connection()
+        try:
+            if self.engine_type == "mysql":
+                conn.begin()
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            suffix = " FOR UPDATE" if self.engine_type == "mysql" else ""
+            cur.execute(self._translate_query(
+                "SELECT * FROM verification_otps WHERE LOWER(email) = LOWER(%s)" + suffix
+            ), (email_clean,))
+            row = cur.fetchone()
+            record = dict(row) if row and not isinstance(row, dict) else row
+            if not record:
+                conn.rollback()
+                return None
+
+            stored_digest = str(record.get("code") or "")
+            try:
+                expires = record.get("expires_at")
+                if not isinstance(expires, datetime.datetime):
+                    expires = datetime.datetime.fromisoformat(str(expires))
+            except (TypeError, ValueError):
+                expires = None
+            valid = (
+                record.get("purpose") == purpose
+                and int(record.get("attempts_left") or 0) > 0
+                and expires is not None
+                and datetime.datetime.now() < expires
+                and secrets.compare_digest(stored_digest, str(code_digest or ""))
+            )
+            if not valid:
+                conn.rollback()
+                return None
+
+            cur.execute(self._translate_query(
+                "DELETE FROM verification_otps WHERE LOWER(email) = LOWER(%s)"
+            ), (email_clean,))
+            payload = record.get("data") or "{}"
+            data = json.loads(payload) if isinstance(payload, str) else dict(payload)
+            conn.commit()
+            data.update({
+                "purpose": record.get("purpose"), "code": stored_digest,
+                "_code_is_hash": True, "attempts_left": int(record.get("attempts_left", 0)),
+                "expires_at": expires.isoformat(),
+            })
+            return data
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def delete_otp(self, email: str, code_digest: str = None, purpose: str = None):
+        conditions = "LOWER(email) = LOWER(%s)"
+        params = [str(email or "").strip()]
+        if code_digest is not None:
+            conditions += " AND code = %s"
+            params.append(str(code_digest))
+        if purpose is not None:
+            conditions += " AND purpose = %s"
+            params.append(str(purpose))
+        self.execute("DELETE FROM verification_otps WHERE " + conditions, tuple(params))
 
     # -------------------------------------------------------------------------
     # CHAT STORAGE

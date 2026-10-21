@@ -6,7 +6,7 @@ TwinStudy is a Flask-based student productivity and academic-support web applica
 
 **Status: validation candidate — not approved for production student data.**
 
-The v6 release has passed 17 dependency-free release checks and Python compilation. Local MariaDB smoke tests also verified OTP digest persistence, atomic attempt decrement, and the registration endpoint's handling of an incorrect OTP using a simulated email sender.
+The v6 release baseline passed 18 dependency-free release checks and Python compilation. The working batch adds API role, serverless gateway, parent privacy, ownership, authentication, and task-preservation regression coverage; see the release tracker for current run results. Earlier local MariaDB smoke tests verified OTP digest persistence, atomic attempt decrement, and registration handling of an incorrect OTP using a simulated email sender.
 
 These tests do not establish that every authentication path, academic CRUD route, multi-instance deployment, or email-delivery workflow is production-ready.
 
@@ -18,6 +18,10 @@ These tests do not establish that every authentication path, academic CRUD route
 - `api/index.py` — serverless entry point.
 - `public/index.html` and `index.html` — frontend copies.
 - `RELEASE_CHECKS.py` — static release checks.
+- `authorization.py` — role policy used by the API request guard.
+- `test_authorization.py` — regression tests for student and operator route roles.
+- `test_parent_visibility.py` and `test_data_ownership.py` — dependency-free privacy, route classification, and ownership regression tests.
+- `test_api_isolation.py` — disposable SQLite and Flask integration tests (requires project dependencies).
 - `vercel.json` — Vercel routing/runtime configuration.
 - `.env.example` — environment-variable names/placeholders; no real secrets should be committed.
 
@@ -39,12 +43,23 @@ These tests do not establish that every authentication path, academic CRUD route
 
    ```bash
    python RELEASE_CHECKS.py
+   python -m unittest test_authorization.py -v
+   python -m unittest test_parent_visibility.py test_data_ownership.py -v
+   python -m unittest test_api_isolation.py -v
    python -m py_compile server.py db_manager.py ai_service.py api/index.py
    ```
 
 7. Start the Flask app using the project's documented entry point and verify the login and academic flows with disposable test accounts before use.
 
 Exact environment-variable requirements and the hosting runtime must be checked against the deployed code and target provider before deployment.
+
+For a production deployment, configure a working managed MySQL/MariaDB connection
+with `DATABASE_URL` or `MYSQL_URL`, or the complete `MYSQL_HOST`, `MYSQL_PORT`,
+`MYSQL_DATABASE`, `MYSQL_USER`, and `MYSQL_PASSWORD` set. Production refuses SQLite
+fallback, including on Vercel where `/tmp` is ephemeral. Configure `GMAIL_USER` (or
+`GMAIL_SENDER`) and `GMAIL_APP_PASSWORD` for registration and password-reset email.
+`GOOGLE_CLIENT_ID` is needed only when enabling Google sign-in. Provide values through
+the hosting provider's secret configuration; `.env.example` contains names only.
 
 ## Database and data safety
 

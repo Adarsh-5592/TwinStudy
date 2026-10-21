@@ -18,7 +18,7 @@ class ReleaseChecks(unittest.TestCase):
         cls.db_manager = (ROOT / "db_manager.py").read_text(encoding="utf-8")
 
     def test_python_sources_compile(self):
-        for name in ("server.py", "db_manager.py", "ai_service.py", "api/index.py"):
+        for name in ("server.py", "db_manager.py", "ai_service.py", "api/index.py", "authorization.py", "parent_visibility.py"):
             source = (ROOT / name).read_text(encoding="utf-8")
             compile(source, name, "exec")
 
@@ -27,6 +27,19 @@ class ReleaseChecks(unittest.TestCase):
 
     def test_frontend_copies_match(self):
         self.assertEqual((ROOT / "index.html").read_bytes(), (ROOT / "public/index.html").read_bytes())
+
+    def test_frontend_stale_revision_recovery_preserves_drafts(self):
+        frontend = (ROOT / "index.html").read_text(encoding="utf-8")
+        helper_start = frontend.index("const refreshRevisionTokens = async () => {")
+        helper_end = frontend.index("const notifyStaleDraft = async", helper_start)
+        helper = frontend[helper_start:helper_end]
+        self.assertIn("academic_revision: latest.academic_revision", helper)
+        self.assertIn("calendar_revision: latest.calendar_revision", helper)
+        for draft_setter in ("setAcademicProfile", "setSubjectsList", "setClassesList", "fetchState"):
+            self.assertNotIn(draft_setter, helper)
+        self.assertEqual(frontend.count('data.code === "stale_revision"'), 3)
+        self.assertEqual(frontend.count('calendarResult.code === "stale_revision"'), 1)
+        self.assertIn("Your draft is still here; review it and save again.", frontend)
 
     def test_otp_retrieval_endpoint_never_returns_code(self):
         start = self.server.index('def auth_get_code():')
@@ -65,13 +78,13 @@ class ReleaseChecks(unittest.TestCase):
         self.assertIn('def decrement_otp_attempts(', self.db_manager)
         self.assertIn('attempts_left = CASE WHEN attempts_left > 0 THEN attempts_left - 1 ELSE 0 END', self.db_manager)
         self.assertIn('def decrement_attempts(', self.server)
-        self.assertGreaterEqual(self.server.count('verification_codes.decrement_attempts(email)'), 2)
+        self.assertGreaterEqual(self.server.count('verification_codes.decrement_attempts('), 2)
 
     def test_invalid_otp_expiry_fails_closed(self):
         start = self.db_manager.index('def get_otp(')
         end = self.db_manager.find('def decrement_otp_attempts(', start)
         body = self.db_manager[start:end]
-        self.assertIn('self.delete_otp(email)', body)
+        self.assertIn('self.delete_otp(email, stored_code, row.get("purpose"))', body)
         self.assertIn('except (TypeError, ValueError):', body)
 
     def test_otp_never_returned_in_development_password_reset(self):
@@ -85,7 +98,8 @@ class ReleaseChecks(unittest.TestCase):
         start = self.server.index('def register_send_otp():')
         end = self.server.find('\n@app.route', start)
         body = self.server[start:end]
-        self.assertIn('verification_codes.pop(email, None)', body)
+        self.assertIn('code_digest=hashlib.sha256(otp.encode("utf-8")).hexdigest(), purpose="register"', body)
+        self.assertNotIn('verification_codes.pop(email, None)', body)
 
 
     def test_production_never_allows_sqlite_fallback(self):
@@ -144,7 +158,8 @@ class ReleaseChecks(unittest.TestCase):
         self.assertIn("_STATE_CONTEXT.forced_owner = None", body)
         self.assertIn("Registration finalization failed after account creation", body)
         self.assertIn("Your account was created, but setup could not be completed", body)
-        self.assertIn("verification_codes.pop(email, None)", body)
+        self.assertIn('verification_codes.consume(email, "register", submitted_code_hash)', body)
+        self.assertNotIn('verification_codes.pop(email, None)', body)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
