@@ -1086,7 +1086,12 @@
           const subName = selectedSub ? selectedSub.name : gradeSubjectId;
           const res = await fetch("/api/grades/add", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+              "Content-Type": "application/json",
+              ...(localStorage.getItem("twinstudy_auth_token")
+                ? { "Authorization": `Bearer ${localStorage.getItem("twinstudy_auth_token")}` }
+                : {})
+            },
             body: JSON.stringify({
               subject_id: gradeSubjectId,
               subject_name: subName,

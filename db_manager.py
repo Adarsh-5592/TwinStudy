@@ -1425,6 +1425,26 @@ class DatabaseManager:
     # -------------------------------------------------------------------------
     # GRADES & TARGETS
     # -------------------------------------------------------------------------
+    def get_user_subject(self, user_id: str, subject_id=None, subject_name=None):
+        """Resolve a subject only within the authenticated user's records."""
+        if subject_id:
+            rows = self.fetchall(
+                "SELECT id, name FROM subjects WHERE id = %s AND user_id = %s LIMIT 1",
+                (subject_id, user_id),
+            )
+            if rows:
+                return rows[0]
+
+        if subject_name:
+            rows = self.fetchall(
+                "SELECT id, name FROM subjects WHERE name = %s AND user_id = %s LIMIT 1",
+                (subject_name, user_id),
+            )
+            if rows:
+                return rows[0]
+
+        return None
+
     def add_grade(self, user_id: str, grade_data: dict):
         g_id = grade_data.get("id") or f"gr_{uuid.uuid4().hex[:10]}"
         self.execute("""
@@ -1449,9 +1469,21 @@ class DatabaseManager:
         cur = self.execute("DELETE FROM grades WHERE id = %s AND user_id = %s", (grade_id, user_id))
         return getattr(cur, "rowcount", 0) == 1
 
+
     def set_subject_target(self, user_id: str, subject_id: str, target: str):
-        self.execute("UPDATE subjects SET target_grade = %s WHERE id = %s AND user_id = %s", (target, subject_id, user_id))
-        return True
+        cur = self.execute(
+            "UPDATE subjects SET target_grade = %s WHERE id = %s AND user_id = %s",
+            (target, subject_id, user_id)
+        )
+        if getattr(cur, "rowcount", 0) == 1:
+            return True
+
+        # MariaDB may report zero changed rows when the value is unchanged.
+        rows = self.fetchall(
+            "SELECT id FROM subjects WHERE id = %s AND user_id = %s LIMIT 1",
+            (subject_id, user_id),
+        )
+        return bool(rows)
 
     def get_user_grades(self, user_id: str):
         return self.fetchall("SELECT * FROM grades WHERE user_id = %s ORDER BY created_at DESC", (user_id,))

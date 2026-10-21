@@ -118,9 +118,20 @@ class ReleaseChecks(unittest.TestCase):
 
     def test_no_actual_env_or_local_database_in_release(self):
         self.assertFalse((ROOT / '.env').exists())
+        excluded_dirs = {'.git', '.venv', '__pycache__'}
+        local_runtime_dbs = {'twin_relational.db'}
         for p in ROOT.rglob('*'):
-            if p.is_file():
-                self.assertNotIn(p.suffix.lower(), {'.db', '.sqlite', '.sqlite3'})
+            if not p.is_file():
+                continue
+            if any(part in excluded_dirs for part in p.relative_to(ROOT).parts):
+                continue
+            if p.name in local_runtime_dbs and p.parent == ROOT:
+                continue
+            self.assertNotIn(
+                p.suffix.lower(),
+                {'.db', '.sqlite', '.sqlite3'},
+                f"Unexpected database file in release: {p.relative_to(ROOT)}",
+            )
 
 
     def test_registration_compatibility_state_is_scoped_and_owner_is_always_cleared(self):

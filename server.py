@@ -13,6 +13,8 @@ Features:
 - Gmail SMTP OTP Dispatch Directly to User Inbox
 """
 
+import math
+import uuid
 import os
 import json
 import random
@@ -3732,24 +3734,86 @@ def get_grades_overview():
 
 @app.route("/api/grades/add", methods=["POST"])
 def record_new_grade():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
+    user = get_auth_user(request)
+
+    if not user:
+        return jsonify({"status": "error", "message": "Authentication required."}), 401
+
+    if user.get("role") not in ("student", "student_adult", "student_minor"):
+        return jsonify({"status": "error", "message": "Only students can record grades."}), 403
+
     sub_id = data.get("subject_id") or data.get("subject_name")
     sub_name = data.get("subject_name") or sub_id
-    ass_name = (data.get("assessment_name") or data.get("title") or data.get("assessment_type") or "Assessment").strip()
-    score = float(data.get("score") or data.get("current_grade") or data.get("marks_obtained") or 0)
-    max_score = float(data.get("max_score", 100))
-    weight = float(data.get("weight", 20))
-    notes = data.get("notes", "")
+
+    if not isinstance(sub_id, str) or not sub_id.strip():
+        return jsonify({"status": "error", "message": "A valid subject is required."}), 400
+
+    try:
+        subject = db_mgr.get_user_subject(user["id"], sub_id.strip(), sub_name)
+    except Exception:
+        app.logger.exception("Failed to verify grade subject ownership")
+        return jsonify({
+            "status": "error",
+            "message": "Could not verify the subject. Please retry."
+        }), 503
+
+    if not subject:
+        return jsonify({
+            "status": "error",
+            "message": "Subject not found for this student."
+        }), 404
+
+    # Use the canonical subject ID and name from this student's database row.
+    sub_id = subject["id"]
+    sub_name = subject["name"]
+    raw_ass_name = (
+        data.get("assessment_name")
+        or data.get("title")
+        or data.get("assessment_type")
+        or "Assessment"
+    )
+
+    if not isinstance(raw_ass_name, str):
+        return jsonify({
+            "status": "error",
+            "message": "Assessment name must be text."
+        }), 400
+
+    ass_name = raw_ass_name.strip()
+
+    if not ass_name:
+        return jsonify({
+            "status": "error",
+            "message": "Assessment name cannot be empty."
+        }), 400
+
+    try:
+        score = float(data.get("score") or data.get("current_grade") or data.get("marks_obtained") or 0)
+        max_score = float(data.get("max_score", 100))
+        weight = float(data.get("weight", 20))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Scores and weight must be numeric."}), 400
 
     if not sub_id or not ass_name:
-        return jsonify({"status": "error", "message": "Subject and Assessment Name are required."}), 400
+        return jsonify({"status": "error", "message": "Subject and assessment name are required."}), 400
 
-    pct = (score / max_score * 100.0) if max_score > 0 else 0
+    if (
+        not math.isfinite(score)
+        or not math.isfinite(max_score)
+        or not math.isfinite(weight)
+        or max_score <= 0
+        or score < 0
+        or score > max_score
+        or weight < 0
+    ):
+        return jsonify({"status": "error", "message": "Invalid score, maximum score, or weight."}), 400
+
+    pct = score / max_score * 100.0
     letter, _ = calculate_letter_grade(pct)
 
-    db = load_db()
     new_g = {
-        "id": f"g_{int(datetime.datetime.now().timestamp()*1000)}",
+        "id": f"g_{uuid.uuid4().hex[:20]}",
         "subject_id": sub_id,
         "subject_name": sub_name or sub_id,
         "assessment_name": ass_name,
@@ -3757,69 +3821,116 @@ def record_new_grade():
         "max_score": max_score,
         "weight": weight,
         "grade_letter": letter,
-        "notes": notes,
+        "notes": data.get("notes", ""),
         "date_recorded": datetime.date.today().isoformat()
     }
-    if "grades" not in db:
-        db["grades"] = []
-    db["grades"].insert(0, new_g)
-    save_db(db)
 
-    user = get_auth_user(request)
-    if user:
-        try:
-            db_mgr.add_grade(user["id"], {
-                "id": new_g["id"],
-                "subject_id": sub_id,
-                "subject_name": sub_name or sub_id,
-                "assessment_type": "Assignment",
-                "title": ass_name,
-                "marks_obtained": score,
-                "max_marks": max_score,
-                "percentage": pct,
-                "grade": letter
-            })
-        except Exception as e:
-            print(f"[DB] Notice recording grade in relational db: {e}")
+    # MariaDB is authoritative: do this before updating compatibility state.
+    try:
+        db_mgr.add_grade(user["id"], {
+            "id": new_g["id"],
+            "subject_id": sub_id,
+            "subject_name": sub_name or sub_id,
+            "assessment_type": data.get("assessment_type", "Assignment"),
+            "title": ass_name,
+            "marks_obtained": score,
+            "max_marks": max_score,
+            "percentage": pct,
+            "grade": letter,
+            "term": data.get("term", "Semester")
+        })
+    except Exception:
+        app.logger.exception("Failed to save grade in relational database")
+        return jsonify({
+            "status": "error",
+            "message": "Grade could not be saved. Please try again."
+        }), 503
 
-    return jsonify({"status": "success", "message": f"Recorded {ass_name} ({letter})", "grade": new_g})
+    # Keep legacy state as a best-effort compatibility mirror.
+    try:
+        db = load_db()
+        db.setdefault("grades", []).insert(0, new_g)
+        save_db(db)
+    except Exception:
+        app.logger.warning(
+            "Grade was saved relationally, but compatibility state could not be updated.",
+            exc_info=True
+        )
+
+    return jsonify({
+        "status": "success",
+        "message": f"Recorded {ass_name} ({letter})",
+        "grade": new_g
+    })
+
 
 @app.route("/api/grades/update-target", methods=["POST"])
 def update_grade_target():
-    data = request.get_json() or {}
-    sub_id = data.get("subject_id") or data.get("subject_name")
+    data = request.get_json(silent=True) or {}
+    sub_id = data.get("subject_id")
     target = data.get("target_grade", "A")
-
     user = get_auth_user(request)
-    if user:
-        try:
-            db_mgr.set_subject_target(user["id"], sub_id, target)
-        except Exception as e:
-            print(f"[DB] Notice updating target in relational db: {e}")
 
-    db = load_db()
-    if "subject_targets" not in db:
-        db["subject_targets"] = {}
-    db["subject_targets"][sub_id] = target
-    save_db(db)
+    if not user:
+        return jsonify({"status": "error", "message": "Authentication required."}), 401
+    if user.get("role") not in ("student", "student_adult", "student_minor"):
+        return jsonify({"status": "error", "message": "Only students can update grade targets."}), 403
+    if not isinstance(sub_id, str) or not sub_id.strip():
+        return jsonify({"status": "error", "message": "A valid subject_id is required."}), 400
+    if not isinstance(target, str) or not target.strip():
+        return jsonify({"status": "error", "message": "A valid target_grade is required."}), 400
+
+    try:
+        updated = db_mgr.set_subject_target(user["id"], sub_id, target.strip())
+    except Exception:
+        app.logger.exception("Failed to update subject target")
+        return jsonify({"status": "error", "message": "Could not update target. Please retry."}), 503
+
+    if not updated:
+        return jsonify({"status": "error", "message": "Subject not found for this student."}), 404
+
+    try:
+        db = load_db()
+        db.setdefault("subject_targets", {})[sub_id] = target.strip()
+        save_db(db)
+    except Exception:
+        app.logger.warning("Target saved relationally, but compatibility state could not be updated.", exc_info=True)
+
     return jsonify({"status": "success", "message": "Subject target updated."})
+
 
 @app.route("/api/grades/delete", methods=["POST"])
 def delete_grade():
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     grade_id = data.get("grade_id")
-
     user = get_auth_user(request)
-    if user and grade_id:
-        try:
-            db_mgr.delete_grade(user["id"], grade_id)
-        except Exception as e:
-            print(f"[DB] Notice deleting grade in relational db: {e}")
 
-    db = load_db()
-    db["grades"] = [g for g in db.get("grades", []) if g.get("id") != grade_id]
-    save_db(db)
+    if not user:
+        return jsonify({"status": "error", "message": "Authentication required."}), 401
+    if user.get("role") not in ("student", "student_adult", "student_minor"):
+        return jsonify({"status": "error", "message": "Only students can delete grades."}), 403
+    if not isinstance(grade_id, str) or not grade_id.strip():
+        return jsonify({"status": "error", "message": "A valid grade_id is required."}), 400
+
+    grade_id = grade_id.strip()
+    try:
+        deleted = db_mgr.delete_grade(user["id"], grade_id)
+    except Exception:
+        app.logger.exception("Failed to delete grade")
+        return jsonify({"status": "error", "message": "Could not delete grade. Please retry."}), 503
+
+    if not deleted:
+        return jsonify({"status": "error", "message": "Grade not found for this student."}), 404
+
+    try:
+        db = load_db()
+        db["grades"] = [g for g in db.get("grades", []) if g.get("id") != grade_id]
+        save_db(db)
+    except Exception:
+        app.logger.warning("Grade deleted relationally, but compatibility state could not be updated.", exc_info=True)
+
     return jsonify({"status": "success", "message": "Grade record deleted."})
+
 
 @app.route("/api/exams", methods=["GET"])
 def get_user_exams():
