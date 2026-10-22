@@ -910,6 +910,7 @@ Rules:
 - Use empty strings for missing or unreadable fields.
 - Class day must be a weekday name when stated clearly.
 - Use ISO dates (YYYY-MM-DD) only when the date is unambiguous; otherwise leave the date empty and explain the ambiguity in uncertain_items.
+- Return class start_time and end_time in 24-hour HH:MM format. If a time is ambiguous, leave it empty and explain it in uncertain_items.
 - Put exam dates in exams. Put holidays, term dates, assignment deadlines, and other college events in calendar_events.
 - Do not invent study sessions or assignment deadlines.
 - Use an empty array when a category has no supported entries.
@@ -1067,6 +1068,43 @@ Rules:
         for key in ("subjects", "classes", "exams", "calendar_events", "uncertain_items"):
             extracted.setdefault(key, [])
 
+        weekday_names = {
+            day[:3].lower(): day for day in
+            ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+        }
+
+        def normalize_time(value):
+            raw = str(value or "").strip().upper()
+            raw = re.sub(r"\s*([AP])\.?\s*M\.?$", r" \1M", raw).strip()
+            raw = raw.replace(".", ":")
+            match = re.fullmatch(r"(\d{1,2})(?::([0-5]\d))?\s*(AM|PM)?", raw)
+            if not match:
+                return ""
+            hour = int(match.group(1))
+            minute = int(match.group(2) or "0")
+            meridiem = match.group(3)
+            if meridiem:
+                if not 1 <= hour <= 12:
+                    return ""
+                hour = hour % 12 + (12 if meridiem == "PM" else 0)
+            elif hour > 23:
+                return ""
+            return f"{hour:02d}:{minute:02d}"
+
+        for class_item in extracted["classes"]:
+            if not isinstance(class_item, dict):
+                continue
+            day_text = str(class_item.get("day") or "").strip().lower().rstrip(".")
+            class_item["day"] = weekday_names.get(day_text, weekday_names.get(day_text[:3], class_item.get("day", "")))
+            class_item["start_time"] = normalize_time(class_item.get("start_time"))
+            class_item["end_time"] = normalize_time(class_item.get("end_time"))
+            if not class_item["day"] or not class_item["start_time"] or not class_item["end_time"]:
+                extracted["uncertain_items"].append({
+                    "type": "class_schedule",
+                    "subject": class_item.get("subject", ""),
+                    "message": "Check the class day and time before relying on this timetable entry.",
+                })
+
         return jsonify({"status": "success", "extraction": extracted})
 
     except requests.Timeout:
@@ -1143,6 +1181,7 @@ def save_academic():
     classes = data.get("classes", [])
     calendar_events = data.get("calendar_events")
     calendar_exams = data.get("calendar_exams")
+    exam_imports = data.get("exams")
     if not isinstance(profile, dict) or not isinstance(subjects, list) or not isinstance(classes, list):
         return jsonify({"status": "error", "message": "Academic profile must be an object; subjects and classes must be lists."}), 400
     if len(subjects) > 300 or len(classes) > 2000:
@@ -1151,6 +1190,8 @@ def save_academic():
         return jsonify({"status": "error", "message": "Academic calendar events must be a list."}), 400
     if calendar_exams is not None and not isinstance(calendar_exams, list):
         return jsonify({"status": "error", "message": "Academic calendar exam records must be a list."}), 400
+    if exam_imports is not None and not isinstance(exam_imports, list):
+        return jsonify({"status": "error", "message": "Imported exam records must be a list."}), 400
 
     user = get_auth_user(request)
     if not user or user.get("role") not in ("student", "student_adult", "student_minor"):
@@ -1213,7 +1254,8 @@ def save_academic():
             expected_revision=academic_revision,
             calendar_events=calendar_events, calendar_exams=calendar_exams,
             expected_calendar_revision=calendar_revision,
-            compatibility_tasks=compatibility_tasks
+            compatibility_tasks=compatibility_tasks,
+            exam_imports=exam_imports
         )
         profile = saved_academic["academic_profile"]
         saved_versions = {

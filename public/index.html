@@ -346,6 +346,7 @@
       const [academicCalendarFile, setAcademicCalendarFile] = useState(null);
       const [academicExtraction, setAcademicExtraction] = useState(null);
       const [academicExtractionLoading, setAcademicExtractionLoading] = useState(false);
+      const [academicImportSaving, setAcademicImportSaving] = useState(false);
       const [academicExtractionError, setAcademicExtractionError] = useState("");
       const [extractedExamsPending, setExtractedExamsPending] = useState([]);
       const [extractedCalendarEventsPending, setExtractedCalendarEventsPending] = useState([]);
@@ -1139,6 +1140,7 @@
               ...(emailParam ? { "x-user-email": emailParam } : {})
             }
           });
+          if (!res.ok) return false;
           const data = await res.json();
           setState(data);
           if (data.academic_profile) {
@@ -1177,8 +1179,10 @@
           await fetchTwinHealth();
           await fetchGrades();
           await fetchStudentParentSettings();
+          return true;
         } catch (e) {
           console.error("Failed to fetch state", e);
+          return false;
         }
       };
 
@@ -2378,137 +2382,219 @@
         }
       };
 
-      const handleUseExtractedAcademicData = () => {
-        if (!academicExtraction) return;
+      const handleUseExtractedAcademicData = async () => {
+        if (!academicExtraction || academicImportSaving) return;
 
         const extracted = academicExtraction;
-        const profile = extracted.academic_profile || {};
-        const profileKeys = [
-          "student_name", "college", "course",
-          "specialization", "semester", "academic_year"
-        ];
+        const studentEmail = String(state?.user?.email || localStorage.getItem("twinstudy_user_email") || "").trim().toLowerCase();
+        const token = localStorage.getItem("twinstudy_auth_token") || "";
+        if (!studentEmail || !token) {
+          const message = "Please sign in again before saving imported academic records.";
+          setAcademicExtractionError(message);
+          showNotification(message);
+          return;
+        }
 
-        setAcademicProfile(prev => {
-          const next = { ...prev };
-          profileKeys.forEach(key => {
-            if (typeof profile[key] === "string" && profile[key].trim()) {
-              next[key] = profile[key].trim();
-            }
+        let latestState;
+        try {
+          const latestResponse = await fetch(`/api/state?email=${encodeURIComponent(studentEmail)}`, {
+            headers: { "Authorization": `Bearer ${token}`, "x-user-email": studentEmail }
           });
-          return next;
-        });
-
-        const importedSubjects = (extracted.subjects || [])
-          .filter(item => item && typeof item.name === "string" && item.name.trim())
-          .map((item, index) => ({
-            ...item,
-            id: item.id || `import_sub_${Date.now()}_${index}`,
-            name: item.name.trim(),
-            color: item.color || "#00C4CC",
-            type: item.type || "Lecture"
-          }));
-
-        setSubjectsList(prev => {
-          const names = new Set(prev.map(item => (item.name || "").trim().toLowerCase()));
-          return [
-            ...prev,
-            ...importedSubjects.filter(item => !names.has(item.name.toLowerCase()))
-          ];
-        });
-
-        const validDays = [
-          "Monday", "Tuesday", "Wednesday", "Thursday",
-          "Friday", "Saturday", "Sunday"
-        ];
-
-        const importedClasses = (extracted.classes || [])
-          .filter(item =>
-            item &&
-            typeof item.subject === "string" && item.subject.trim() &&
-            validDays.includes(item.day) &&
-            /^\d{2}:\d{2}$/.test(item.start_time || "") &&
-            /^\d{2}:\d{2}$/.test(item.end_time || "")
-          )
-          .map((item, index) => {
-            const subjectName = item.subject.trim();
-            const subjectRecord =
-              importedSubjects.find(subject => subject.name.toLowerCase() === subjectName.toLowerCase()) ||
-              subjectsList.find(subject => subject.name.toLowerCase() === subjectName.toLowerCase());
-
-            return {
-              ...item,
-              id: item.id || `import_class_${Date.now()}_${index}`,
-              subject: subjectName,
-              subject_id: item.subject_id || subjectRecord?.id || "",
-              time: `${item.start_time} - ${item.end_time}`,
-              color: item.color || subjectRecord?.color || "#00C4CC",
-              type: item.type || subjectRecord?.type || "Lecture",
-              week_type: item.week_type || "All"
-            };
-          });
-
-        setClassesList(prev => {
-          const keys = new Set(prev.map(item =>
-            `${item.day}|${(item.subject || "").toLowerCase()}|${item.start_time}|${item.end_time}`
-          ));
-          return [
-            ...prev,
-            ...importedClasses.filter(item => {
-              const key = `${item.day}|${item.subject.toLowerCase()}|${item.start_time}|${item.end_time}`;
-              if (keys.has(key)) return false;
-              keys.add(key);
-              return true;
-            })
-          ];
-        });
-
-        const importedCalendarEvents = Array.isArray(extracted.calendar_events) ? extracted.calendar_events : [];
-        const importedCalendarExams = Array.isArray(extracted.exams) ? extracted.exams : [];
-        setExtractedExamsPending(importedCalendarExams);
-        setExtractedCalendarEventsPending(importedCalendarEvents);
-        setAcademicExtractionImported(true);
-
-        // Persist calendar data independently; it must not depend on saving the full timetable.
-        (async () => {
-          try {
-            const studentEmail = (state?.user?.email || localStorage.getItem("twinstudy_user_email") || "").trim().toLowerCase();
-            const token = localStorage.getItem("twinstudy_auth_token") || "";
-            if (!studentEmail || !token) {
-              showNotification("Calendar added to setup, but saving requires an active student login. Please sign in again.");
-              return;
-            }
-            const calendarResponse = await fetch("/api/academic/calendar-save", {
-              method: "POST",
-              credentials: "same-origin",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${token}`,
-                "x-user-email": studentEmail
-              },
-              body: JSON.stringify({
-                email: studentEmail,
-                calendar_revision: state?.calendar_revision,
-                calendar_events: importedCalendarEvents,
-                calendar_exams: importedCalendarExams
-              })
-            });
-            const calendarResult = await calendarResponse.json();
-            if (!calendarResponse.ok || calendarResult.status !== "success") {
-              if (calendarResponse.status === 409 && calendarResult.code === "stale_revision") {
-                await notifyStaleDraft("Calendar changes");
-              } else {
-                showNotification(calendarResult.message || "Calendar was added to setup but could not be saved.");
-              }
-              return;
-            }
-            showNotification(`Academic calendar saved: ${calendarResult.event_count} events and ${calendarResult.exam_count} exams.`);
-            if (typeof fetchState === "function") await fetchState();
-          } catch (calendarError) {
-            console.error("Academic calendar save failed:", calendarError);
-            showNotification("Calendar was added to setup but saving failed. Please try importing again.");
+          latestState = await latestResponse.json();
+          if (!latestResponse.ok || String(latestState?.user?.id || "") !== String(state?.user?.id || "")) {
+            throw new Error(latestState?.message || "The signed-in student's academic state could not be loaded.");
           }
-        })();
-        showNotification("Calendar extraction added to setup. Saving will run separately from the timetable.");
+        } catch (error) {
+          const message = error.message || "Could not reload current academic records. Please retry before importing.";
+          setAcademicExtractionError(message);
+          showNotification(message);
+          return;
+        }
+        if (latestState.academic_revision !== state?.academic_revision || latestState.calendar_revision !== state?.calendar_revision) {
+          await notifyStaleDraft("Imported academic data");
+          return;
+        }
+
+        const extractedProfile = extracted.academic_profile || {};
+        const profileKeys = ["student_name", "college", "course", "specialization", "semester", "academic_year"];
+        const nextProfile = { ...(latestState.academic_profile || {}), ...academicProfile };
+        profileKeys.forEach(key => {
+          if (typeof extractedProfile[key] === "string" && extractedProfile[key].trim()) {
+            nextProfile[key] = extractedProfile[key].trim();
+          }
+        });
+
+        const importedSubjects = (Array.isArray(extracted.subjects) ? extracted.subjects : [])
+          .filter(item => item && typeof item.name === "string" && item.name.trim())
+          .map((item, index) => ({ ...item, id: item.id || `import_sub_${Date.now()}_${index}`, name: item.name.trim() }));
+        const nextSubjects = [...(Array.isArray(latestState.subjects) ? latestState.subjects : [])];
+        const mergeSubject = item => {
+          const key = String(item?.name || "").trim().toLowerCase();
+          if (!key) return;
+          const idIndex = item.id ? nextSubjects.findIndex(existing => existing.id === item.id) : -1;
+          if (idIndex >= 0) {
+            nextSubjects[idIndex] = { ...nextSubjects[idIndex], ...item };
+            return;
+          }
+          const subjectNames = new Set(nextSubjects.map(existing => String(existing.name || "").trim().toLowerCase()));
+          if (!subjectNames.has(key)) {
+            nextSubjects.push({ ...item, color: item.color || "#00C4CC", type: item.type || "Lecture" });
+          }
+        };
+        (Array.isArray(subjectsList) ? subjectsList : []).forEach(mergeSubject);
+        importedSubjects.forEach(mergeSubject);
+        const subjectByName = new Map(nextSubjects.map(item => [String(item.name || "").trim().toLowerCase(), item]));
+
+        const weekdayNames = { mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday", fri: "Friday", sat: "Saturday", sun: "Sunday" };
+        const normalizeTime = value => {
+          const match = String(value || "").trim().toUpperCase().match(/^(\d{1,2})(?::([0-5]\d))?\s*(AM|PM)?$/);
+          if (!match) return "";
+          let hour = Number(match[1]);
+          const minute = Number(match[2] || "0");
+          if (match[3]) {
+            if (hour < 1 || hour > 12) return "";
+            hour = (hour % 12) + (match[3] === "PM" ? 12 : 0);
+          } else if (hour > 23) return "";
+          return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+        };
+        const validDays = new Set(Object.values(weekdayNames));
+        const sourceClasses = Array.isArray(extracted.classes) ? extracted.classes : [];
+        const importedClasses = sourceClasses.flatMap((item, index) => {
+          if (!item || typeof item.subject !== "string" || !item.subject.trim()) return [];
+          const rawDay = String(item.day || "").trim().toLowerCase().replace(/\.$/, "");
+          const day = weekdayNames[rawDay.slice(0, 3)] || Object.values(weekdayNames).find(name => name.toLowerCase() === rawDay);
+          if (!day || !validDays.has(day)) return [];
+          const subjectName = item.subject.trim();
+          const subjectRecord = subjectByName.get(subjectName.toLowerCase());
+          const startTime = normalizeTime(item.start_time);
+          const endTime = normalizeTime(item.end_time);
+          return [{
+            ...item,
+            id: item.id || `import_class_${Date.now()}_${index}`,
+            day,
+            subject: subjectName,
+            subject_id: item.subject_id || subjectRecord?.id || "",
+            start_time: startTime,
+            end_time: endTime,
+            time: startTime && endTime ? `${startTime} - ${endTime}` : "Time needs review",
+            color: item.color || subjectRecord?.color || "#00C4CC",
+            type: item.type || subjectRecord?.type || "Lecture",
+            week_type: item.week_type || "All"
+          }];
+        });
+        const existingClasses = Array.isArray(latestState.classes) ? [...latestState.classes] : [];
+        const classKey = item => `${String(item.day || "").toLowerCase()}|${String(item.subject || item.subject_name || "").trim().toLowerCase()}|${item.start_time || ""}|${item.end_time || ""}`;
+        const nextClasses = [...existingClasses];
+        const mergeClass = item => {
+          const idIndex = item.id ? nextClasses.findIndex(existing => existing.id === item.id) : -1;
+          if (idIndex >= 0) {
+            nextClasses[idIndex] = { ...nextClasses[idIndex], ...item };
+            return;
+          }
+          const classKeys = new Set(nextClasses.map(classKey));
+          const key = classKey(item);
+          if (!classKeys.has(key)) {
+            nextClasses.push(item);
+          }
+        };
+        (Array.isArray(classesList) ? classesList : []).forEach(mergeClass);
+        importedClasses.forEach(mergeClass);
+
+        const mergeCalendarRecords = (existing, incoming, kind) => {
+          const result = [...(Array.isArray(existing) ? existing : [])];
+          const keyFor = item => {
+            const id = String(item?.id || "").trim();
+            const title = String(item?.title || item?.subject_name || item?.subject || item?.name || "").trim().toLowerCase();
+            const date = String(item?.event_date || item?.exam_date || item?.date || "").slice(0, 10);
+            const category = String(item?.event_type || item?.type || "").trim().toLowerCase();
+            return id ? `id:${id}` : `${kind}:${title}|${date}|${category}`;
+          };
+          const keys = new Set(result.map(keyFor));
+          (Array.isArray(incoming) ? incoming : []).forEach(item => {
+            if (!item || typeof item !== "object") return;
+            const key = keyFor(item);
+            if (!keys.has(key)) {
+              result.push(item);
+              keys.add(key);
+            }
+          });
+          return result;
+        };
+        const importedEvents = (Array.isArray(extracted.calendar_events) ? extracted.calendar_events : [])
+          .filter(item => item && typeof item === "object")
+          .map(item => ({ ...item, event_date: item.event_date || item.date || "" }));
+        const importedCalendarExams = (Array.isArray(extracted.exams) ? extracted.exams : [])
+          .filter(item => item && typeof item === "object")
+          .map(item => ({ ...item, exam_date: item.exam_date || item.date || "" }));
+        const nextCalendarEvents = mergeCalendarRecords(
+          mergeCalendarRecords(latestState.calendar_events, state?.calendar_events, "event"), importedEvents, "event"
+        );
+        const nextCalendarExams = mergeCalendarRecords(
+          mergeCalendarRecords(latestState.calendar_exams, state?.calendar_exams, "exam"), importedCalendarExams, "exam"
+        );
+
+        // Keep the reviewed draft visible if persistence fails or the revision is stale.
+        setAcademicProfile(nextProfile);
+        setSubjectsList(nextSubjects);
+        setClassesList(nextClasses);
+        setExtractedExamsPending(importedCalendarExams);
+        setExtractedCalendarEventsPending(importedEvents);
+        setAcademicImportSaving(true);
+        setAcademicExtractionError("");
+        try {
+          const response = await fetch("/api/academic/save", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${token}`,
+              "x-user-email": studentEmail
+            },
+            body: JSON.stringify({
+              email: studentEmail,
+              academic_profile: nextProfile,
+              academic_revision: state?.academic_revision,
+              calendar_revision: state?.calendar_revision,
+              subjects: nextSubjects,
+              classes: nextClasses,
+              exams: Array.isArray(extracted.exams) ? extracted.exams : [],
+              calendar_events: nextCalendarEvents,
+              calendar_exams: nextCalendarExams
+            })
+          });
+          const result = await response.json();
+          if (!response.ok || result.status !== "success") {
+            if (response.status === 409 && result.code === "stale_revision") {
+              await notifyStaleDraft("Imported academic data");
+            } else {
+              const message = result.message || "Import could not be saved. Your reviewed draft remains available; please retry.";
+              setAcademicExtractionError(message);
+              showNotification(message);
+            }
+            return;
+          }
+
+          const refreshed = await fetchState();
+          if (!refreshed) {
+            const message = "The import was saved, but the dashboard could not refresh. Reload the page to see the saved records.";
+            setAcademicExtractionError(message);
+            showNotification(message);
+            return;
+          }
+          setExtractedExamsPending([]);
+          setExtractedCalendarEventsPending([]);
+          setAcademicExtractionImported(true);
+          setShowSetupModal(false);
+          const skippedClasses = sourceClasses.length - importedClasses.length;
+          const timeReviewClasses = importedClasses.filter(item => !item.start_time || !item.end_time).length;
+          showNotification(`Imported and saved ${importedSubjects.length} subjects, ${importedClasses.length} class sessions, ${importedCalendarExams.length} exams, and ${importedEvents.length} calendar events.${skippedClasses > 0 ? ` ${skippedClasses} row(s) need a clear weekday or subject and were left for manual entry.` : ""}${timeReviewClasses > 0 ? ` ${timeReviewClasses} class time(s) need manual review.` : ""}`);
+        } catch (error) {
+          const message = "Academic import failed to save. Your reviewed draft remains available; check the connection and retry.";
+          setAcademicExtractionError(message);
+          showNotification(message);
+        } finally {
+          setAcademicImportSaving(false);
+        }
       };
 
       const handleSaveCompleteAcademicSetup = async () => {
@@ -6463,7 +6549,7 @@
                       <div>
                         <div className="text-sm font-extrabold text-navySlate">Set up automatically from college documents</div>
                         <p className="text-xs text-navySlate/70 mt-1">
-                          Upload a timetable and/or academic calendar. TwinStudy will read them for you to review before importing.
+                          Upload a timetable and/or academic calendar. Review the results, then import them to save your profile, subjects, classes, exams, and calendar together.
                         </p>
                       </div>
 
@@ -6564,14 +6650,15 @@
 
                           <button
                             type="button"
+                            disabled={academicImportSaving}
                             onClick={handleUseExtractedAcademicData}
-                            className="px-4 py-2 rounded-xl btn-cyan text-xs font-bold"
+                            className="px-4 py-2 rounded-xl btn-cyan text-xs font-bold disabled:opacity-50"
                           >
-                            {academicExtractionImported ? "Imported — use again" : "Use extracted details"}
+                            {academicImportSaving ? "Saving imported details..." : (academicExtractionImported ? "Import and save again" : "Import and save details")}
                           </button>
                           {academicExtractionImported && (
                             <p className="text-xs text-emerald-700">
-                              Imported into the setup form. Continue to Subjects and Weekly Timetable to review the entries before saving.
+                              Imported details were saved to your account and the dashboard was refreshed.
                             </p>
                           )}
                         </div>

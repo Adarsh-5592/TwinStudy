@@ -7,6 +7,7 @@ from pathlib import Path
 import ast
 import json
 import re
+import subprocess
 import unittest
 
 ROOT = Path(__file__).resolve().parent
@@ -38,8 +39,26 @@ class ReleaseChecks(unittest.TestCase):
         for draft_setter in ("setAcademicProfile", "setSubjectsList", "setClassesList", "fetchState"):
             self.assertNotIn(draft_setter, helper)
         self.assertEqual(frontend.count('data.code === "stale_revision"'), 3)
-        self.assertEqual(frontend.count('calendarResult.code === "stale_revision"'), 1)
+        self.assertEqual(frontend.count('calendarResult.code === "stale_revision"'), 0)
         self.assertIn("Your draft is still here; review it and save again.", frontend)
+
+    def test_document_import_saves_reviewed_records_together_and_refreshes(self):
+        frontend = (ROOT / "index.html").read_text(encoding="utf-8")
+        start = frontend.index("const handleUseExtractedAcademicData = async () => {")
+        end = frontend.index("const handleSaveCompleteAcademicSetup = async () => {", start)
+        handler = frontend[start:end]
+        self.assertIn('fetch("/api/academic/save"', handler)
+        self.assertNotIn('fetch("/api/academic/calendar-save"', handler)
+        self.assertIn("mergeCalendarRecords(latestState.calendar_events, state?.calendar_events", handler)
+        self.assertIn("mergeCalendarRecords(latestState.calendar_exams, state?.calendar_exams", handler)
+        self.assertIn("const nextSubjects = [...(Array.isArray(latestState.subjects) ? latestState.subjects : [])]", handler)
+        self.assertIn("const nextClasses = [...existingClasses]", handler)
+        self.assertIn('exams: Array.isArray(extracted.exams) ? extracted.exams : []', handler)
+        self.assertIn("latestState.academic_revision !== state?.academic_revision", handler)
+        self.assertIn("if (!response.ok || result.status !== \"success\")", handler)
+        self.assertIn('result.code === "stale_revision"', handler)
+        self.assertIn("const refreshed = await fetchState()", handler)
+        self.assertIn('Import and save details', frontend)
 
     def test_otp_retrieval_endpoint_never_returns_code(self):
         start = self.server.index('def auth_get_code():')
@@ -131,21 +150,34 @@ class ReleaseChecks(unittest.TestCase):
         self.assertIn('str(d.get("user_id", "")) == str(user["id"])', body)
 
     def test_no_actual_env_or_local_database_in_release(self):
-        self.assertFalse((ROOT / '.env').exists())
-        excluded_dirs = {'.git', '.venv', '__pycache__'}
-        local_runtime_dbs = {'twin_relational.db'}
-        for p in ROOT.rglob('*'):
-            if not p.is_file():
-                continue
-            if any(part in excluded_dirs for part in p.relative_to(ROOT).parts):
-                continue
-            if p.name in local_runtime_dbs and p.parent == ROOT:
-                continue
-            self.assertNotIn(
-                p.suffix.lower(),
-                {'.db', '.sqlite', '.sqlite3'},
-                f"Unexpected database file in release: {p.relative_to(ROOT)}",
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "-z"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        )
+        release_paths = [Path(path.decode("utf-8")) for path in result.stdout.split(b"\0") if path]
+        forbidden_names = {"twin_database.json", "twin_state.json", "email_config.json"}
+        database_suffixes = {".db", ".sqlite", ".sqlite3"}
+
+        for path in release_paths:
+            parts = path.parts
+            name = path.name.lower()
+            is_env_file = any(
+                part.lower() == ".env"
+                or (part.lower().startswith(".env.") and part.lower() != ".env.example")
+                for part in parts
             )
+            is_runtime_database = name in forbidden_names or path.suffix.lower() in database_suffixes
+            is_runtime_artifact = (
+                "backups" in {part.lower() for part in parts}
+                or name.endswith((".log", ".bak", ".backup"))
+                or name.endswith("-backup")
+                or ".before-" in name
+            )
+            self.assertFalse(is_env_file, f"Environment file included in release: {path}")
+            self.assertFalse(is_runtime_database, f"Runtime data included in release: {path}")
+            self.assertFalse(is_runtime_artifact, f"Runtime artifact included in release: {path}")
 
 
     def test_registration_compatibility_state_is_scoped_and_owner_is_always_cleared(self):

@@ -3,6 +3,7 @@ import importlib
 import importlib.util
 import datetime
 import io
+import json
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -622,6 +623,120 @@ class ApiIsolationTests(unittest.TestCase):
             self.db.get_user_data_versions(self.users["student_b"]["id"])["academic_revision"],
             other_academic_revision,
         )
+
+    def test_document_extraction_returns_normalized_review_data(self):
+        model_output = {
+            "academic_profile": {"college": "Example College", "course": "Biology"},
+            "subjects": [{"name": "Biology", "code": "BIO101"}],
+            "classes": [{"subject": "Biology", "day": "mon", "start_time": "9:30 AM", "end_time": "11:00 AM"}],
+            "exams": [{"title": "Midterm", "subject_name": "Biology", "exam_date": "2026-11-02"}],
+            "calendar_events": [{"title": "Term begins", "event_date": "2026-10-26"}],
+            "uncertain_items": [],
+        }
+
+        class ModelResponse:
+            ok = True
+            status_code = 200
+            text = ""
+
+            @staticmethod
+            def json():
+                return {"candidates": [{"content": {"parts": [{"text": json.dumps(model_output)}]}}]}
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "disposable-test-key"}), \
+             patch("requests.post", return_value=ModelResponse()):
+            response = self.client.post(
+                "/api/academic/extract-documents",
+                headers=self.auth("student_a"),
+                data={"timetable_file": (io.BytesIO(b"disposable pdf bytes"), "timetable.pdf")},
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        extraction = response.get_json()["extraction"]
+        self.assertEqual(extraction["academic_profile"]["course"], "Biology")
+        self.assertEqual(extraction["subjects"][0]["name"], "Biology")
+        self.assertEqual(extraction["classes"][0]["day"], "Monday")
+        self.assertEqual(extraction["classes"][0]["start_time"], "09:30")
+        self.assertEqual(extraction["classes"][0]["end_time"], "11:00")
+        self.assertEqual(extraction["exams"][0]["exam_date"], "2026-11-02")
+        self.assertEqual(extraction["calendar_events"][0]["event_date"], "2026-10-26")
+
+    def test_confirmed_document_import_persists_and_reloads_all_academic_records(self):
+        user, error = self.db.create_user(
+            f"document-import-{uuid.uuid4().hex}@example.test", "Disposable-Password-42!", "Import student", role="student"
+        )
+        self.assertIsNone(error)
+        auth = {"Authorization": f"Bearer {self.db.create_session(user['id'])}"}
+        academic_revision, calendar_revision = self.current_revisions(auth)
+        payload = {
+            "academic_revision": academic_revision,
+            "calendar_revision": calendar_revision,
+            "academic_profile": {"student_name": "Import student", "college": "Example College", "course": "Biology"},
+            "subjects": [{"id": "import-bio", "name": "Biology", "code": "BIO101"}],
+            "classes": [{"id": "import-bio-mon", "subject": "Biology", "day": "Monday", "start_time": "09:30", "end_time": "11:00", "time": "09:30 - 11:00"}],
+            "exams": [{"id": "import-bio-midterm", "title": "Biology Midterm", "subject_name": "Biology", "exam_date": "2026-11-02"}],
+            "calendar_events": [{"id": "import-term-start", "title": "Term begins", "event_date": "2026-10-26", "event_type": "term"}],
+            "calendar_exams": [{"id": "import-calendar-midterm", "title": "Biology Midterm", "subject_name": "Biology", "exam_date": "2026-11-02"}],
+        }
+
+        imported = self.client.post("/api/academic/save", headers=auth, json=payload)
+        self.assertEqual(imported.status_code, 200, imported.get_json())
+        saved = self.db.get_user_academic_state(user["id"])
+        self.assertEqual(saved["academic_profile"]["course"], "Biology")
+        self.assertEqual([item["name"] for item in saved["subjects"]], ["Biology"])
+        self.assertEqual([item["day"] for item in saved["classes"]], ["Monday"])
+        self.assertEqual([item["title"] for item in saved["exams"]], ["Biology Midterm"])
+        calendar = self.db.get_user_calendar(user["id"])
+        self.assertEqual(calendar["calendar_events"][0]["title"], "Term begins")
+        self.assertEqual(calendar["calendar_exams"][0]["title"], "Biology Midterm")
+
+        reloaded = self.client.get("/api/state", headers=auth)
+        self.assertEqual(reloaded.status_code, 200, reloaded.get_json())
+        dashboard = reloaded.get_json()
+        self.assertEqual(dashboard["academic_profile"]["course"], "Biology")
+        self.assertEqual(len(dashboard["subjects"]), 1)
+        self.assertEqual(len(dashboard["classes"]), 1)
+        self.assertEqual(len(dashboard["exams"]), 1)
+        self.assertEqual(len(dashboard["calendar_events"]), 1)
+        self.assertEqual(len(dashboard["calendar_exams"]), 1)
+
+        other_state = self.client.get("/api/state", headers=self.auth("student_b")).get_json()
+        self.assertEqual(other_state["subjects"], [])
+        self.assertEqual(other_state["classes"], [])
+        self.assertEqual(other_state["exams"], [])
+        self.assertEqual(other_state["calendar_events"], [])
+
+        latest = dashboard
+        repeated_payload = {**payload, "academic_revision": latest["academic_revision"],
+                            "calendar_revision": latest["calendar_revision"], "exams": [],
+                            "subjects": latest["subjects"], "classes": latest["classes"],
+                            "calendar_events": latest["calendar_events"],
+                            "calendar_exams": latest["calendar_exams"]}
+        repeated = self.client.post("/api/academic/save", headers=auth, json=repeated_payload)
+        self.assertEqual(repeated.status_code, 200, repeated.get_json())
+        preserved = self.db.get_user_academic_state(user["id"])
+        self.assertEqual(len(preserved["subjects"]), 1)
+        self.assertEqual(len(preserved["classes"]), 1)
+        self.assertEqual(len(preserved["exams"]), 1)
+        self.assertEqual(len(self.db.get_user_calendar(user["id"])["calendar_events"]), 1)
+
+    def test_academic_import_database_failure_is_returned_as_error(self):
+        user, error = self.db.create_user(
+            f"document-import-fail-{uuid.uuid4().hex}@example.test", "Disposable-Password-42!", "Import failure", role="student"
+        )
+        self.assertIsNone(error)
+        auth = {"Authorization": f"Bearer {self.db.create_session(user['id'])}"}
+        academic_revision, _calendar_revision = self.current_revisions(auth)
+        with patch.object(self.db, "save_user_academic_state", side_effect=RuntimeError("simulated database failure")):
+            response = self.client.post("/api/academic/save", headers=auth, json={
+                "academic_revision": academic_revision,
+                "academic_profile": {"college": "Example College", "course": "Biology"},
+                "subjects": [{"id": "must-not-save", "name": "Biology"}],
+                "classes": [], "exams": [],
+            })
+        self.assertEqual(response.status_code, 503)
+        self.assertNotEqual(response.get_json().get("status"), "success")
+        self.assertEqual(self.db.get_user_academic_state(user["id"])["subjects"], [])
 
     def test_collection_replacements_require_current_revision_tokens(self):
         academic = self.client.post("/api/academic/save", headers=self.auth("student_a"), json={

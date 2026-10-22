@@ -966,7 +966,7 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def save_user_academic_state(self, user_id: str, profile: dict, subjects: list, classes: list, tasks: list = None, preserve_existing_tasks: bool = False, expected_revision: int = None, calendar_events: list = None, calendar_exams: list = None, expected_calendar_revision: int = None, compatibility_tasks: list = None):
+    def save_user_academic_state(self, user_id: str, profile: dict, subjects: list, classes: list, tasks: list = None, preserve_existing_tasks: bool = False, expected_revision: int = None, calendar_events: list = None, calendar_exams: list = None, expected_calendar_revision: int = None, compatibility_tasks: list = None, exam_imports: list = None):
         """Atomically replace one student's normalized academic and optional calendar data.
 
         Request-supplied identifiers are preserved only when they are not owned by a
@@ -983,6 +983,8 @@ class DatabaseManager:
             raise ValueError("Tasks must be a list")
         if compatibility_tasks is not None and (not isinstance(compatibility_tasks, list) or len(compatibility_tasks) > 2000):
             raise ValueError("Compatibility tasks must be a list of at most 2000 records")
+        if exam_imports is not None and (not isinstance(exam_imports, list) or len(exam_imports) > 1000):
+            raise ValueError("Imported exams must be a list of at most 1000 records")
         if calendar_events is not None and (not isinstance(calendar_events, list) or len(calendar_events) > 2000):
             raise ValueError("Calendar events must be a list of at most 2000 records")
         if calendar_exams is not None and (not isinstance(calendar_exams, list) or len(calendar_exams) > 1000):
@@ -1130,6 +1132,47 @@ class DatabaseManager:
                          1 if item.get("verified") else 0, str(item.get("verified_file") or ""),
                          str(item.get("quiz_score") or ""), str(item.get("verified_at") or "")))
                     item["subject_id"] = resolved_sid
+
+            # Document imports add exams; they never replace the student's existing
+            # exam collection. The academic revision lock above serializes imports
+            # with other academic writes, and this all runs in the same transaction.
+            if exam_imports is not None:
+                existing_exam_rows = execute(
+                    "SELECT id, title, subject_name, exam_date FROM exams WHERE user_id = %s",
+                    (user_id,),
+                ).fetchall()
+                existing_exam_keys = {
+                    (str(row.get("title") or "").strip().casefold(),
+                     str(row.get("subject_name") or "").strip().casefold(),
+                     str(row.get("exam_date") or "").strip()[:10])
+                    for row in (dict(value) if not isinstance(value, dict) else value for value in existing_exam_rows)
+                }
+                for raw_exam in exam_imports:
+                    if not isinstance(raw_exam, dict):
+                        raise ValueError("Each imported exam must be an object")
+                    exam = dict(raw_exam)
+                    title = str(exam.get("title") or exam.get("subject_name") or "Exam").strip()[:255]
+                    subject_name = str(exam.get("subject_name") or exam.get("subject") or "").strip()[:191]
+                    exam_date = str(exam.get("exam_date") or exam.get("date") or "").strip()[:64]
+                    exam_key = (title.casefold(), subject_name.casefold(), exam_date[:10])
+                    if exam_key in existing_exam_keys:
+                        continue
+
+                    exam_id = str(exam.get("id") or f"ex_{uuid.uuid4().hex[:24]}")[:64]
+                    existing_id = fetchone("SELECT user_id FROM exams WHERE id = %s", (exam_id,))
+                    if existing_id and str(existing_id.get("user_id")) != str(user_id):
+                        exam_id = f"ex_{uuid.uuid4().hex[:24]}"
+                    elif existing_id:
+                        existing_exam_keys.add(exam_key)
+                        continue
+                    execute("""INSERT INTO exams
+                        (id,user_id,subject_id,subject_name,title,exam_date,weight_pct,target_score,syllabus_summary)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        (exam_id, user_id, str(exam.get("subject_id") or "")[:64], subject_name,
+                         title, exam_date, safe_float(exam.get("weight_pct", exam.get("weight", 30.0)), 30.0),
+                         safe_float(exam.get("target_score", exam.get("target", 85.0)), 85.0),
+                         str(exam.get("syllabus_summary") or exam.get("syllabus") or "")))
+                    existing_exam_keys.add(exam_key)
 
             if calendar_events is not None:
                 execute("DELETE FROM academic_calendar_events WHERE user_id = %s", (user_id,))
